@@ -19,7 +19,7 @@
 %% Rabbit exchange type functions:
 -export([ description/0
         , serialise_events/0
-        , route/2
+        , route/3
         , validate/1
         , create/2
         , delete/2
@@ -89,14 +89,14 @@ description() -> [ {name, <<"jms-selector">>}
 serialise_events() -> false.
 
 % Route messages
-route( #exchange{name = XName}
-     , #delivery{message = #basic_message{content = MessageContent, routing_keys = RKs}}
-     ) ->
+route(#exchange{name = XName}, Msg, _Opts) ->
+    RKs = mc:get_annotation(routing_keys, Msg),
+    Content = mc:protocol_state(mc:convert(mc_amqpl, Msg)),
     case get_binding_funs_x(XName) of
         not_found ->
             [];
         BindingFuns ->
-            match_bindings(XName, RKs, MessageContent, BindingFuns)
+            match_bindings(XName, RKs, Content, BindingFuns)
     end.
 
 
@@ -104,18 +104,19 @@ route( #exchange{name = XName}
 validate(_X) -> ok.
 
 % After exchange declaration and recovery
-create(none, #exchange{name = XName}) ->
+create(_Tx, #exchange{name = XName}) ->
   add_initial_record(XName).
 
 % Delete an exchange
-delete(none, #exchange{name = XName}) ->
-    delete_state(XName).
+delete(_Tx, #exchange{name = XName}) ->
+    delete_state(XName),
+    ok.
 
 % Before add binding
 validate_binding(_X, _B) -> ok.
 
 % A new binding has ben added or recovered
-add_binding( none
+add_binding( _Tx
            , #exchange{name = XName}
            , #binding{key = BindingKey, destination = Dest, args = Args}
            ) ->
@@ -130,7 +131,7 @@ add_binding( none
   ok.
 
 % Binding removal
-remove_bindings( none
+remove_bindings( _Tx
                , #exchange{name = XName}
                , Bindings
                ) ->

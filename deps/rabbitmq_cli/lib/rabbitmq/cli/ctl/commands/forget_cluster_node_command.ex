@@ -39,7 +39,13 @@ defmodule RabbitMQ.CLI.Ctl.Commands.ForgetClusterNodeCommand do
       become(node_name, opts),
       RabbitMQ.CLI.Core.Helpers.defer(fn ->
         _ = :rabbit_event.start_link()
-        :rabbit_db_cluster.forget_member(to_atom(node_to_remove), true)
+
+        try do
+          :rabbit_db_cluster.forget_member(to_atom(node_to_remove), true)
+        catch
+          :error, :undef ->
+            :rabbit_mnesia.forget_cluster_node(to_atom(node_to_remove), true)
+        end
       end)
     ])
   end
@@ -66,6 +72,9 @@ defmodule RabbitMQ.CLI.Ctl.Commands.ForgetClusterNodeCommand do
         {:error,
          "RabbitMQ on node #{node_to_remove} must be stopped with 'rabbitmqctl -n #{node_to_remove} stop_app' before it can be removed"}
 
+      {:error, {:failed_to_remove_node, ^atom_name, unavailable}} ->
+        {:error, "Node #{node_to_remove} must be running before it can be removed"}
+
       {:error, _} = error ->
         error
 
@@ -73,13 +82,55 @@ defmodule RabbitMQ.CLI.Ctl.Commands.ForgetClusterNodeCommand do
         error
 
       :ok ->
-        case :rabbit_misc.rpc_call(node_name, :rabbit_quorum_queue, :shrink_all, [atom_name]) do
-          {:error, _} ->
+        qq_shrink_result =
+          :rabbit_misc.rpc_call(node_name, :rabbit_quorum_queue, :shrink_all, [atom_name])
+
+        stream_shrink_result =
+          case :rabbit_misc.rpc_call(node_name, :rabbit_stream_queue, :delete_all_replicas, [
+                 atom_name
+               ]) do
+            ## For backwards compatibility
+            {:badrpc, {:EXIT, {:undef, [{:rabbit_stream_queue, :delete_all_replicas, _, _}]}}} ->
+              []
+
+            any ->
+              any
+          end
+
+        is_error_fun = fn
+          {_, {:ok, _}} ->
+            false
+
+          {_, :ok} ->
+            false
+
+          {_, {:error, _, _}} ->
+            true
+
+          {_, {:error, _}} ->
+            true
+        end
+
+        has_qq_error =
+          not Enum.empty?(qq_shrink_result) and Enum.any?(qq_shrink_result, is_error_fun)
+
+        has_stream_error =
+          not Enum.empty?(stream_shrink_result) and Enum.any?(stream_shrink_result, is_error_fun)
+
+        case {has_qq_error, has_stream_error} do
+          {false, false} ->
+            :ok
+
+          {true, false} ->
             {:error,
              "RabbitMQ failed to shrink some of the quorum queues on node #{node_to_remove}"}
 
-          _ ->
-            :ok
+          {false, true} ->
+            {:error, "RabbitMQ failed to shrink some of the streams on node #{node_to_remove}"}
+
+          {true, true} ->
+            {:error,
+             "RabbitMQ failed to shrink some of the quorum queues and streams on node #{node_to_remove}"}
         end
 
       other ->

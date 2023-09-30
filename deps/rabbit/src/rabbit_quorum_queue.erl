@@ -27,17 +27,19 @@
 -export([settle/5, dequeue/5, consume/3, cancel/5]).
 -export([credit/5]).
 -export([purge/1]).
--export([stateless_deliver/2, deliver/2]).
+-export([stateless_deliver/2, deliver/3]).
 -export([dead_letter_publish/5]).
 -export([cluster_state/1, status/2]).
 -export([update_consumer_handler/8, update_consumer/9]).
 -export([cancel_consumer_handler/2, cancel_consumer/3]).
 -export([become_leader/2, handle_tick/3, spawn_deleter/1]).
--export([rpc_delete_metrics/1]).
+-export([rpc_delete_metrics/1,
+         key_metrics_rpc/1]).
 -export([format/1]).
 -export([open_files/1]).
 -export([peek/2, peek/3]).
--export([add_member/4, add_member/2]).
+-export([add_member/2,
+         add_member/4]).
 -export([delete_member/3, delete_member/2]).
 -export([requeue/3]).
 -export([policy_changed/1]).
@@ -77,11 +79,11 @@
 
 -include_lib("stdlib/include/qlc.hrl").
 -include_lib("rabbit_common/include/rabbit.hrl").
--include_lib("rabbit_common/include/rabbit_framing.hrl").
 -include("amqqueue.hrl").
 
 -type msg_id() :: non_neg_integer().
--type qmsg() :: {rabbit_types:r('queue'), pid(), msg_id(), boolean(), rabbit_types:message()}.
+-type qmsg() :: {rabbit_types:r('queue'), pid(), msg_id(), boolean(),
+                 mc:state()}.
 
 -define(RA_SYSTEM, quorum_queues).
 -define(RA_WAL_NAME, ra_log_wal).
@@ -161,11 +163,17 @@ is_compatible(_, _, _) ->
 -spec init(amqqueue:amqqueue()) -> {ok, rabbit_fifo_client:state()}.
 init(Q) when ?is_amqqueue(Q) ->
     {ok, SoftLimit} = application:get_env(rabbit, quorum_commands_soft_limit),
-    %% This lookup could potentially return an {error, not_found}, but we do not
-    %% know what to do if the queue has `disappeared`. Let it crash.
-    {Name, _LeaderNode} = Leader = amqqueue:get_pid(Q),
+    {Name, _} = MaybeLeader = amqqueue:get_pid(Q),
+    Leader = case ra_leaderboard:lookup_leader(Name) of
+                 undefined ->
+                     %% leader from queue record will have to suffice
+                     MaybeLeader;
+                 LikelyLeader ->
+                     LikelyLeader
+             end,
     Nodes = get_nodes(Q),
-    %% Ensure the leader is listed first
+    %% Ensure the leader is listed first to increase likelihood of first
+    %% server tried is the one we want
     Servers0 = [{Name, N} || N <- Nodes],
     Servers = [Leader | lists:delete(Leader, Servers0)],
     {ok, rabbit_fifo_client:init(Servers, SoftLimit)}.
@@ -245,7 +253,7 @@ start_cluster(Q) ->
                     %% config cannot be updated
                     ok = rabbit_fifo_client:update_machine_state(LeaderId,
                                                                  ra_machine_config(NewQ)),
-                    notify_decorators(QName, startup),
+                    notify_decorators(NewQ, startup),
                     rabbit_quorum_queue_periodic_membership_reconciliation:queue_created(NewQ),
                     rabbit_event:notify(queue_created,
                                         [{name, QName},
@@ -374,7 +382,15 @@ become_leader(QName, Name) ->
 
 -spec all_replica_states() -> {node(), #{atom() => atom()}}.
 all_replica_states() ->
-    Rows = ets:tab2list(ra_state),
+    Rows0 = ets:tab2list(ra_state),
+    Rows = lists:map(fun
+                         %% TODO: support other membership types
+                         ({K, S, voter}) ->
+                             {K, S};
+                         (T) ->
+                             T
+                     end, Rows0),
+
     {node(), maps:from_list(Rows)}.
 
 -spec list_with_minimum_quorum() -> [amqqueue:amqqueue()].
@@ -414,7 +430,9 @@ filter_quorum_critical(Queues, ReplicaStates) ->
                     AllUp = lists:filter(fun (N) ->
                                             {Name, _} = amqqueue:get_pid(Q),
                                             case maps:get(N, ReplicaStates, undefined) of
-                                                #{Name := State} when State =:= follower orelse State =:= leader ->
+                                                #{Name := State}
+                                                  when State =:= follower orelse
+                                                       State =:= leader ->
                                                     true;
                                                 _ -> false
                                             end
@@ -894,39 +912,30 @@ stateless_deliver(ServerId, Delivery) ->
     ok = rabbit_fifo_client:untracked_enqueue([ServerId],
                                               Delivery#delivery.message).
 
--spec deliver(rabbit_amqqueue:name(), Confirm :: boolean(),
-              rabbit_types:delivery(), rabbit_fifo_client:state()) ->
-    {ok, rabbit_fifo_client:state(), rabbit_queue_type:actions()} |
-    {reject_publish, rabbit_fifo_client:state()}.
-deliver(QName, false, Delivery, QState0) ->
-    case rabbit_fifo_client:enqueue(QName, Delivery#delivery.message, QState0) of
-        {ok, _State, _Actions} = Res ->
-            Res;
+deliver0(QName, undefined, Msg, QState0) ->
+    case rabbit_fifo_client:enqueue(QName, Msg, QState0) of
+        {ok, _, _} = Res -> Res;
         {reject_publish, State} ->
             {ok, State, []}
     end;
-deliver(QName, true, Delivery, QState0) ->
-    rabbit_fifo_client:enqueue(QName,
-                               Delivery#delivery.msg_seq_no,
-                               Delivery#delivery.message, QState0).
+deliver0(QName, Correlation, Msg, QState0) ->
+    rabbit_fifo_client:enqueue(QName, Correlation,
+                               Msg, QState0).
 
-deliver(QSs, #delivery{message = #basic_message{content = Content0} = Msg,
-                       confirm = Confirm} = Delivery0) ->
-    %% TODO: we could also consider clearing out the message id here
-    Content = prepare_content(Content0),
-    Delivery = Delivery0#delivery{message = Msg#basic_message{content = Content}},
+deliver(QSs, Msg0, Options) ->
+    Correlation = maps:get(correlation, Options, undefined),
+    Msg = mc:prepare(store, Msg0),
     lists:foldl(
       fun({Q, stateless}, {Qs, Actions}) ->
               QRef = amqqueue:get_pid(Q),
-              ok = rabbit_fifo_client:untracked_enqueue(
-                     [QRef], Delivery#delivery.message),
+              ok = rabbit_fifo_client:untracked_enqueue([QRef], Msg),
               {Qs, Actions};
          ({Q, S0}, {Qs, Actions}) ->
               QName = amqqueue:get_name(Q),
-              case deliver(QName, Confirm, Delivery, S0) of
+              case deliver0(QName, Correlation, Msg, S0) of
                   {reject_publish, S} ->
-                      Seq = Delivery#delivery.msg_seq_no,
-                      {[{Q, S} | Qs], [{rejected, QName, [Seq]} | Actions]};
+                      {[{Q, S} | Qs],
+                       [{rejected, QName, [Correlation]} | Actions]};
                   {ok, S, As} ->
                       {[{Q, S} | Qs], As ++ Actions}
               end
@@ -1040,6 +1049,10 @@ cluster_state(Name) ->
             end
     end.
 
+key_metrics_rpc(ServerId) ->
+    Metrics = ra:key_metrics(ServerId),
+    Metrics#{machine_version := rabbit_fifo:version()}.
+
 -spec status(rabbit_types:vhost(), Name :: rabbit_misc:resource_name()) ->
     [[{binary(), term()}]] | {error, term()}.
 status(Vhost, QueueName) ->
@@ -1050,34 +1063,67 @@ status(Vhost, QueueName) ->
             {error, classic_queue_not_supported};
         {ok, Q} when ?amqqueue_is_quorum(Q) ->
             {RName, _} = amqqueue:get_pid(Q),
-            Nodes = get_nodes(Q),
+            Nodes = lists:sort(get_nodes(Q)),
             [begin
-                 case get_sys_status({RName, N}) of
-                     {ok, Sys} ->
-                         {_, M} = lists:keyfind(ra_server_state, 1, Sys),
-                         {_, RaftState} = lists:keyfind(raft_state, 1, Sys),
-                         #{commit_index := Commit,
-                           machine_version := MacVer,
-                           current_term := Term,
-                           log := #{last_index := Last,
-                                    snapshot_index := SnapIdx}} = M,
+                 ServerId = {RName, N},
+                 case erpc_call(N, ?MODULE, key_metrics_rpc, [ServerId], ?RPC_TIMEOUT) of
+                     #{state := RaftState,
+                       membership := Membership,
+                       commit_index := Commit,
+                       term := Term,
+                       last_index := Last,
+                       last_applied := LastApplied,
+                       last_written_index := LastWritten,
+                       snapshot_index := SnapIdx,
+                       machine_version := MacVer} ->
                          [{<<"Node Name">>, N},
                           {<<"Raft State">>, RaftState},
-                          {<<"Log Index">>, Last},
+                          {<<"Membership">>, Membership},
+                          {<<"Last Log Index">>, Last},
+                          {<<"Last Written">>, LastWritten},
+                          {<<"Last Applied">>, LastApplied},
                           {<<"Commit Index">>, Commit},
                           {<<"Snapshot Index">>, SnapIdx},
                           {<<"Term">>, Term},
                           {<<"Machine Version">>, MacVer}
                          ];
                      {error, Err} ->
-                         [{<<"Node Name">>, N},
-                          {<<"Raft State">>, Err},
-                          {<<"Log Index">>, <<>>},
-                          {<<"Commit Index">>, <<>>},
-                          {<<"Snapshot Index">>, <<>>},
-                          {<<"Term">>, <<>>},
-                          {<<"Machine Version">>, <<>>}
-                         ]
+                         %% try the old method
+                         case get_sys_status(ServerId) of
+                             {ok, Sys} ->
+                                 {_, M} = lists:keyfind(ra_server_state, 1, Sys),
+                                 {_, RaftState} = lists:keyfind(raft_state, 1, Sys),
+                                 #{commit_index := Commit,
+                                   machine_version := MacVer,
+                                   current_term := Term,
+                                   last_applied := LastApplied,
+                                   log := #{last_index := Last,
+                                            last_written_index_term := {LastWritten, _},
+                                            snapshot_index := SnapIdx}} = M,
+                                 [{<<"Node Name">>, N},
+                                  {<<"Raft State">>, RaftState},
+                                  {<<"Membership">>, voter},
+                                  {<<"Last Log Index">>, Last},
+                                  {<<"Last Written">>, LastWritten},
+                                  {<<"Last Applied">>, LastApplied},
+                                  {<<"Commit Index">>, Commit},
+                                  {<<"Snapshot Index">>, SnapIdx},
+                                  {<<"Term">>, Term},
+                                  {<<"Machine Version">>, MacVer}
+                                 ];
+                             {error, Err} ->
+                                 [{<<"Node Name">>, N},
+                                  {<<"Raft State">>, Err},
+                                  {<<"Membership">>, <<>>},
+                                  {<<"LastLog Index">>, <<>>},
+                                  {<<"Last Written">>, <<>>},
+                                  {<<"Last Applied">>, <<>>},
+                                  {<<"Commit Index">>, <<>>},
+                                  {<<"Snapshot Index">>, <<>>},
+                                  {<<"Term">>, <<>>},
+                                  {<<"Machine Version">>, <<>>}
+                                 ]
+                         end
                  end
              end || N <- Nodes];
         {ok, _Q} ->
@@ -1096,7 +1142,6 @@ get_sys_status(Proc) ->
             {error, other}
 
     end.
-
 
 add_member(VHost, Name, Node, Timeout) ->
     QName = #resource{virtual_host = VHost, name = Name, kind = queue},
@@ -1127,6 +1172,7 @@ add_member(VHost, Name, Node, Timeout) ->
 
 add_member(Q, Node) ->
     add_member(Q, Node, ?ADD_MEMBER_TIMEOUT).
+
 add_member(Q, Node, Timeout) when ?amqqueue_is_quorum(Q) ->
     {RaName, _} = amqqueue:get_pid(Q),
     QName = amqqueue:get_name(Q),
@@ -1137,10 +1183,11 @@ add_member(Q, Node, Timeout) when ?amqqueue_is_quorum(Q) ->
                                       ?TICK_TIMEOUT),
     SnapshotInterval = application:get_env(rabbit, quorum_snapshot_interval,
                                            ?SNAPSHOT_INTERVAL),
-    Conf = make_ra_conf(Q, ServerId, TickTimeout, SnapshotInterval),
+    Conf = make_ra_conf(Q, ServerId, TickTimeout, SnapshotInterval, voter),
     case ra:start_server(?RA_SYSTEM, Conf) of
         ok ->
-            case ra:add_member(Members, ServerId, Timeout) of
+            ServerIdSpec = maps:with([id, uid, membership], Conf),
+            case ra:add_member(Members, ServerIdSpec, Timeout) of
                 {ok, _, Leader} ->
                     Fun = fun(Q1) ->
                                   Q2 = update_type_state(
@@ -1579,9 +1626,12 @@ peek(Pos, Q) when ?is_amqqueue(Q) andalso ?amqqueue_is_quorum(Q) ->
                         #{delivery_count := C} -> C;
                        _ -> 0
                     end,
-            Msg = rabbit_basic:add_header(<<"x-delivery-count">>, long,
-                                          Count, Msg0),
-            {ok, rabbit_basic:peek_fmt_message(Msg)};
+            Msg = mc:set_annotation(<<"x-delivery-count">>, Count, Msg0),
+            XName = mc:get_annotation(exchange, Msg),
+            RoutingKeys = mc:get_annotation(routing_keys, Msg),
+            AmqpLegacyMsg = mc:prepare(read, mc:convert(mc_amqpl, Msg)),
+            Content = mc:protocol_state(AmqpLegacyMsg),
+            {ok, rabbit_basic:peek_fmt_message(XName, RoutingKeys, Content)};
         {error, Err} ->
             {error, Err};
         Err ->
@@ -1638,23 +1688,27 @@ format_ra_event(ServerId, Evt, QRef) ->
     {'$gen_cast', {queue_event, QRef, {ServerId, Evt}}}.
 
 make_ra_conf(Q, ServerId, TickTimeout, SnapshotInterval) ->
+    make_ra_conf(Q, ServerId, TickTimeout, SnapshotInterval, voter).
+
+make_ra_conf(Q, ServerId, TickTimeout, SnapshotInterval, Membership) ->
     QName = amqqueue:get_name(Q),
     RaMachine = ra_machine(Q),
     [{ClusterName, _} | _] = Members = members(Q),
     UId = ra:new_uid(ra_lib:to_binary(ClusterName)),
     FName = rabbit_misc:rs(QName),
     Formatter = {?MODULE, format_ra_event, [QName]},
-    #{cluster_name => ClusterName,
-      id => ServerId,
-      uid => UId,
-      friendly_name => FName,
-      metrics_key => QName,
-      initial_members => Members,
-      log_init_args => #{uid => UId,
-                         snapshot_interval => SnapshotInterval},
-      tick_timeout => TickTimeout,
-      machine => RaMachine,
-      ra_event_formatter => Formatter}.
+    rabbit_misc:maps_put_truthy(membership, Membership,
+                                #{cluster_name => ClusterName,
+                                  id => ServerId,
+                                  uid => UId,
+                                  friendly_name => FName,
+                                  metrics_key => QName,
+                                  initial_members => Members,
+                                  log_init_args => #{uid => UId,
+                                                     snapshot_interval => SnapshotInterval},
+                                  tick_timeout => TickTimeout,
+                                  machine => RaMachine,
+                                  ra_event_formatter => Formatter}).
 
 get_nodes(Q) when ?is_amqqueue(Q) ->
     #{nodes := Nodes} = amqqueue:get_type_state(Q),
@@ -1704,6 +1758,10 @@ notify_decorators(Q) when ?is_amqqueue(Q) ->
 notify_decorators(QName, Event) ->
     notify_decorators(QName, Event, []).
 
+notify_decorators(Q, F, A) when ?is_amqqueue(Q) ->
+    Ds = amqqueue:get_decorators(Q),
+    [ok = apply(M, F, [Q|A]) || M <- rabbit_queue_decorator:select(Ds)],
+    ok;
 notify_decorators(QName, F, A) ->
     %% Look up again in case policy and hence decorators have changed
     case rabbit_amqqueue:lookup(QName) of
@@ -1714,20 +1772,6 @@ notify_decorators(QName, F, A) ->
         {error, not_found} ->
             ok
     end.
-
-%% remove any data that a quorum queue doesn't need
-prepare_content(#content{properties = none} = Content) ->
-    Content;
-prepare_content(#content{protocol = none} = Content) ->
-    Content;
-prepare_content(#content{properties = #'P_basic'{expiration = undefined} = Props,
-                         protocol = Proto} = Content) ->
-    Content#content{properties = none,
-                    properties_bin = Proto:encode_properties(Props)};
-prepare_content(Content) ->
-    %% expiration is set. Therefore, leave properties decoded so that
-    %% rabbit_fifo can directly parse it without having to decode again.
-    Content.
 
 ets_lookup_element(Tbl, Key, Pos, Default) ->
     try ets:lookup_element(Tbl, Key, Pos) of

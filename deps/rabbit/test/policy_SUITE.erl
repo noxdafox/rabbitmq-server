@@ -8,26 +8,46 @@
 -module(policy_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include_lib("rabbitmq_ct_helpers/include/rabbit_assert.hrl").
 
 -compile(export_all).
 
 all() ->
     [
-      {group, cluster_size_2}
+     {group, mnesia_store},
+     {group, khepri_store},
+     {group, khepri_migration}
     ].
 
 groups() ->
     [
-     {cluster_size_2, [], [
-                           target_count_policy,
-                           policy_ttl,
-                           operator_policy_ttl,
-                           operator_retroactive_policy_ttl,
-                           operator_retroactive_policy_publish_ttl,
-                           queue_type_specific_policies
-                          ]}
+     {mnesia_store, [], [target_count_policy] ++ all_tests()},
+     {khepri_store, [], all_tests()},
+     {khepri_migration, [], [
+                             from_mnesia_to_khepri
+                            ]}
+    ].
+
+all_tests() ->
+    [
+     policy_ttl,
+     operator_policy_ttl,
+     operator_retroactive_policy_ttl,
+     operator_retroactive_policy_publish_ttl,
+     queue_type_specific_policies,
+     classic_queue_version_policies,
+     is_supported_operator_policy_expires,
+     is_supported_operator_policy_message_ttl,
+     is_supported_operator_policy_max_length,
+     is_supported_operator_policy_max_length,
+     is_supported_operator_policy_max_in_memory_length,
+     is_supported_operator_policy_max_in_memory_bytes,
+     is_supported_operator_policy_delivery_limit,
+     is_supported_operator_policy_target_group_size,
+     is_supported_operator_policy_ha
     ].
 
 %% -------------------------------------------------------------------
@@ -41,29 +61,46 @@ init_per_suite(Config) ->
 end_per_suite(Config) ->
     rabbit_ct_helpers:run_teardown_steps(Config).
 
-init_per_group(cluster_size_2, Config) ->
-    Suffix = rabbit_ct_helpers:testcase_absname(Config, "", "-"),
-    Config1 = rabbit_ct_helpers:set_config(Config, [
-                                                    {rmq_nodes_count, 2},
-                                                    {rmq_nodename_suffix, Suffix}
-      ]),
-    rabbit_ct_helpers:run_steps(Config1,
-      rabbit_ct_broker_helpers:setup_steps() ++
-      rabbit_ct_client_helpers:setup_steps()).
+init_per_group(mnesia_store = Group, Config0) ->
+    Config = rabbit_ct_helpers:set_config(Config0, [{metadata_store, mnesia}]),
+    init_per_group_common(Group, Config, 2);
+init_per_group(khepri_store = Group, Config0) ->
+    Config = rabbit_ct_helpers:set_config(Config0, [{metadata_store, khepri}]),
+    init_per_group_common(Group, Config, 2);
+init_per_group(khepri_migration = Group, Config0) ->
+    Config = rabbit_ct_helpers:set_config(Config0, [{metadata_store, mnesia}]),
+    init_per_group_common(Group, Config, 1).
 
-end_per_group(_Group, Config) ->
+init_per_group_common(Group, Config, Size) ->
+    Config1 = rabbit_ct_helpers:set_config(Config,
+                                           [{rmq_nodes_count, Size},
+                                            {rmq_nodename_suffix, Group},
+                                            {tcp_ports_base}]),
+    rabbit_ct_helpers:run_steps(Config1, rabbit_ct_broker_helpers:setup_steps()).
+
+end_per_group(_, Config) ->
     rabbit_ct_helpers:run_steps(Config,
-      rabbit_ct_client_helpers:teardown_steps() ++
-      rabbit_ct_broker_helpers:teardown_steps()).
+                                rabbit_ct_broker_helpers:teardown_steps()).
 
 init_per_testcase(Testcase, Config) ->
-    rabbit_ct_client_helpers:setup_steps(),
-    rabbit_ct_helpers:testcase_started(Config, Testcase).
+    Config1 = rabbit_ct_helpers:testcase_started(Config, Testcase),
+    Name = rabbit_data_coercion:to_binary(Testcase),
+    Group = proplists:get_value(name, ?config(tc_group_properties, Config)),
+    Policy = rabbit_data_coercion:to_binary(io_lib:format("~p_~p_policy", [Group, Testcase])),
+    OpPolicy = rabbit_data_coercion:to_binary(io_lib:format("~p_~p_op_policy", [Group, Testcase])),
+    Config2 = rabbit_ct_helpers:set_config(Config1,
+                                           [{queue_name, Name},
+                                            {policy, Policy},
+                                            {op_policy, OpPolicy}
+                                           ]),
+    rabbit_ct_helpers:run_steps(Config2, rabbit_ct_client_helpers:setup_steps()).
 
 end_per_testcase(Testcase, Config) ->
-    rabbit_ct_client_helpers:teardown_steps(),
-    rabbit_ct_helpers:testcase_finished(Config, Testcase).
-
+    rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, delete_queues, []),
+    _ = rabbit_ct_broker_helpers:clear_policy(Config, 0, ?config(policy, Config)),
+    _ = rabbit_ct_broker_helpers:clear_operator_policy(Config, 0, ?config(op_policy, Config)),
+    Config1 = rabbit_ct_helpers:run_steps(Config, rabbit_ct_client_helpers:teardown_steps()),
+    rabbit_ct_helpers:testcase_finished(Config1, Testcase).
 %% -------------------------------------------------------------------
 %% Test cases.
 %% -------------------------------------------------------------------
@@ -246,18 +283,202 @@ queue_type_specific_policies(Config) ->
     rabbit_ct_client_helpers:close_connection(Conn),
     passed.
 
+classic_queue_version_policies(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    QName = <<"policy_queue_version">>,
+    declare(Ch, QName),
+    QueueVersionOnePolicy = [{<<"queue-version">>, 1}],
+    QueueVersionTwoPolicy = [{<<"queue-version">>, 2}],
+
+    Opts = #{config => Config,
+             server => Server,
+             qname  => QName},
+
+    %% Queue version OperPolicy has precedence always
+    verify_policies(QueueVersionOnePolicy, QueueVersionTwoPolicy, QueueVersionTwoPolicy, Opts),
+    verify_policies(QueueVersionTwoPolicy, QueueVersionOnePolicy, QueueVersionOnePolicy, Opts),
+
+    delete(Ch, QName),
+    rabbit_ct_broker_helpers:clear_policy(Config, 0, <<"policy">>),
+    rabbit_ct_broker_helpers:clear_operator_policy(Config, 0, <<"op_policy">>),
+    rabbit_ct_client_helpers:close_channel(Ch),
+    rabbit_ct_client_helpers:close_connection(Conn),
+    passed.
+
+%% See supported policies in https://www.rabbitmq.com/parameters.html#operator-policies
+%% This test applies all supported operator policies to all queue types,
+%% and later verifies the effective policy definitions.
+%% Just those supported by each queue type should be present.
+
+is_supported_operator_policy_expires(Config) ->
+    Value = 6000000,
+    effective_operator_policy_per_queue_type(
+      Config, <<"expires">>, Value, Value, Value, undefined).
+
+is_supported_operator_policy_message_ttl(Config) ->
+    Value = 1000,
+    effective_operator_policy_per_queue_type(
+      Config, <<"message-ttl">>, Value, Value, Value, undefined).
+
+is_supported_operator_policy_max_length(Config) ->
+    Value = 500,
+    effective_operator_policy_per_queue_type(
+      Config, <<"max-length">>, Value, Value, Value, undefined).
+
+is_supported_operator_policy_max_length_bytes(Config) ->
+    Value = 1500,
+    effective_operator_policy_per_queue_type(
+      Config, <<"max-length-bytes">>, Value, Value, Value, Value).
+
+is_supported_operator_policy_max_in_memory_length(Config) ->
+    Value = 30,
+    effective_operator_policy_per_queue_type(
+      Config, <<"max-in-memory-length">>, Value, undefined, Value, undefined).
+
+is_supported_operator_policy_max_in_memory_bytes(Config) ->
+    Value = 50000,
+    effective_operator_policy_per_queue_type(
+      Config, <<"max-in-memory-bytes">>, Value, undefined, Value, undefined).
+
+is_supported_operator_policy_delivery_limit(Config) ->
+    Value = 3,
+    effective_operator_policy_per_queue_type(
+      Config, <<"delivery-limit">>, Value, undefined, Value, undefined).
+
+is_supported_operator_policy_target_group_size(Config) ->
+    Value = 5,
+    effective_operator_policy_per_queue_type(
+      Config, <<"target-group-size">>, Value, undefined, Value, undefined).
+
+is_supported_operator_policy_ha(Config) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    ClassicQ = <<"classic_queue">>,
+    QuorumQ = <<"quorum_queue">>,
+    StreamQ = <<"stream_queue">>,
+
+    declare(Ch, ClassicQ, [{<<"x-queue-type">>, longstr, <<"classic">>}]),
+    declare(Ch, QuorumQ, [{<<"x-queue-type">>, longstr, <<"quorum">>}]),
+    declare(Ch, StreamQ, [{<<"x-queue-type">>, longstr, <<"stream">>}]),
+
+    case ?config(metadata_store, Config) of
+        mnesia ->
+            rabbit_ct_broker_helpers:set_operator_policy(
+              Config, 0, <<"operator-policy">>, <<".*">>, <<"all">>,
+              [{<<"ha-mode">>, <<"exactly">>},
+               {<<"ha-params">>, 2},
+               {<<"ha-sync-mode">>, <<"automatic">>}]),
+
+            ?awaitMatch(<<"exactly">>, check_policy_value(Server, ClassicQ, <<"ha-mode">>), 30_000),
+            ?awaitMatch(2, check_policy_value(Server, ClassicQ, <<"ha-params">>), 30_000),
+            ?awaitMatch(<<"automatic">>, check_policy_value(Server, ClassicQ, <<"ha-sync-mode">>), 30_000),
+            ?awaitMatch(undefined, check_policy_value(Server, QuorumQ, <<"ha-mode">>), 30_000),
+            ?awaitMatch(undefined, check_policy_value(Server, StreamQ, <<"ha-mode">>), 30_000),
+
+            rabbit_ct_broker_helpers:clear_operator_policy(Config, 0, <<"operator-policy">>);
+        khepri ->
+            ?assertError(
+               {badmatch, _},
+               rabbit_ct_broker_helpers:set_operator_policy(
+                 Config, 0, <<"operator-policy">>, <<".*">>, <<"all">>,
+                 [{<<"ha-mode">>, <<"exactly">>},
+                  {<<"ha-params">>, 2},
+                  {<<"ha-sync-mode">>, <<"automatic">>}]))
+    end,
+
+    delete(Ch, ClassicQ),
+    delete(Ch, QuorumQ),
+    delete(Ch, StreamQ),
+
+    rabbit_ct_client_helpers:close_channel(Ch),
+    rabbit_ct_client_helpers:close_connection(Conn),
+    passed.
+
+effective_operator_policy_per_queue_type(Config, Name, Value, ClassicValue, QuorumValue, StreamValue) ->
+    [Server | _] = rabbit_ct_broker_helpers:get_node_configs(Config, nodename),
+    {Conn, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    ClassicQ = <<"classic_queue">>,
+    QuorumQ = <<"quorum_queue">>,
+    StreamQ = <<"stream_queue">>,
+
+    declare(Ch, ClassicQ, [{<<"x-queue-type">>, longstr, <<"classic">>}]),
+    declare(Ch, QuorumQ, [{<<"x-queue-type">>, longstr, <<"quorum">>}]),
+    declare(Ch, StreamQ, [{<<"x-queue-type">>, longstr, <<"stream">>}]),
+
+    rabbit_ct_broker_helpers:set_operator_policy(
+      Config, 0, <<"operator-policy">>, <<".*">>, <<"all">>,
+      [{Name, Value}]),
+
+    ?awaitMatch(ClassicValue, check_policy_value(Server, ClassicQ, Name), 30_000),
+    ?awaitMatch(QuorumValue, check_policy_value(Server, QuorumQ, Name), 30_000),
+    ?awaitMatch(StreamValue, check_policy_value(Server, StreamQ, Name), 30_000),
+
+    rabbit_ct_broker_helpers:clear_operator_policy(Config, 0, <<"operator-policy">>),
+
+    delete(Ch, ClassicQ),
+    delete(Ch, QuorumQ),
+    delete(Ch, StreamQ),
+
+    rabbit_ct_client_helpers:close_channel(Ch),
+    rabbit_ct_client_helpers:close_connection(Conn),
+    passed.
 
 %%----------------------------------------------------------------------------
+from_mnesia_to_khepri(Config) ->
+    Server = rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename),
 
+    Ch = rabbit_ct_client_helpers:open_channel(Config, Server),
+    Q = ?config(queue_name, Config),
+    ?assertEqual({'queue.declare_ok', Q, 0, 0}, declare(Ch, Q)),
+
+    Policy = ?config(policy, Config),
+    ok = rabbit_ct_broker_helpers:set_policy(Config, 0, Policy, Q,
+                                             <<"queues">>,
+                                             [{<<"dead-letter-exchange">>, <<>>},
+                                              {<<"dead-letter-routing-key">>, Q}]),
+    OpPolicy = ?config(op_policy, Config),
+    ok = rabbit_ct_broker_helpers:set_operator_policy(Config, 0, OpPolicy, Q,
+                                                      <<"queues">>,
+                                                      [{<<"max-length">>, 10000}]),
+
+    Policies0 = lists:sort(rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_policy, list, [])),
+    Names0 = lists:sort([proplists:get_value(name, Props) || Props <- Policies0]),
+
+    ?assertEqual([Policy], Names0),
+
+    OpPolicies0 = lists:sort(rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_policy, list_op, [])),
+    OpNames0 = lists:sort([proplists:get_value(name, Props) || Props <- OpPolicies0]),
+
+    ?assertEqual([OpPolicy], OpNames0),
+
+    case rabbit_ct_broker_helpers:enable_feature_flag(Config, khepri_db) of
+        ok ->
+            rabbit_ct_helpers:await_condition(
+              fun() ->
+                      (Policies0 ==
+                           lists:sort(rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_policy, list, [])))
+                          andalso
+                            (OpPolicies0 ==
+                                 lists:sort(rabbit_ct_broker_helpers:rpc(Config, 0, rabbit_policy, list_op, [])))
+              end);
+        Skip ->
+            Skip
+    end.
+
+%%----------------------------------------------------------------------------
+delete_queues() ->
+    [{ok, _} = rabbit_amqqueue:delete(Q, false, false, <<"dummy">>)
+     || Q <- rabbit_amqqueue:list()].
 
 declare(Ch, Q) ->
     amqp_channel:call(Ch, #'queue.declare'{queue     = Q,
-                                           durable   = true}).
+                                                                   durable   = true}).
 
 declare(Ch, Q, Args) ->
     amqp_channel:call(Ch, #'queue.declare'{queue     = Q,
-                                           durable   = true,
-                                           arguments = Args}).
+                                                                   durable   = true,
+                                                                   arguments = Args}).
 
 delete(Ch, Q) ->
     amqp_channel:call(Ch, #'queue.delete'{queue = Q}).
@@ -305,17 +526,22 @@ get_messages(Number, Ch, Q) ->
     end.
 
 check_policy_value(Server, QName, Value) ->
+    ct:pal("QUEUES ~p",
+           [rpc:call(Server, rabbit_amqqueue, list, [])]),
     {ok, Q} = rpc:call(Server, rabbit_amqqueue, lookup, [rabbit_misc:r(<<"/">>, queue, QName)]),
-    proplists:get_value(Value, rpc:call(Server, rabbit_policy, effective_definition, [Q])).
+    case rpc:call(Server, rabbit_policy, effective_definition, [Q]) of
+        List when is_list(List) -> proplists:get_value(Value, List);
+        Any -> Any
+    end.
 
 verify_policies(Policy, OperPolicy, VerifyFuns, #{config := Config,
                                                   server := Server,
                                                   qname := QName}) ->
     rabbit_ct_broker_helpers:set_policy(Config, 0, <<"policy">>,
-                                        <<"policy_ha">>, <<"queues">>,
+                                        QName, <<"queues">>,
                                         Policy),
     rabbit_ct_broker_helpers:set_operator_policy(Config, 0, <<"op_policy">>,
-                                                 <<"policy_ha">>, <<"queues">>,
+                                                 QName, <<"queues">>,
                                                  OperPolicy),
     verify_policy(VerifyFuns, Server, QName).
 

@@ -16,12 +16,14 @@ jobs:
           name: '1_13'
         - elixir_version: "1.14"
           name: '1_14'
+        - elixir_version: "1.15"
+          name: '1_15'
     timeout-minutes: 10
     env:
       branch: bump-elixir-${{ matrix.elixir_version }}
     steps:
     - name: CHECKOUT REPOSITORY
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     - name: FAIL IF THE PR ALREADY EXISTS
       id: check-for-branch
       run: |
@@ -59,12 +61,13 @@ jobs:
         OLD_SHA="$(cat MODULE.bazel | buildozer 'print sha256' -:${{ matrix.name }})"
         OLD_VERSION="$(cat MODULE.bazel | buildozer 'print version' -:${{ matrix.name }})"
 
+        echo "OLD_SHA: $OLD_SHA"
+        echo "OLD_VERSION: $OLD_VERSION"
+
         echo "$(cat MODULE.bazel | buildozer 'set sha256 "${{ steps.fetch-version.outputs.SHA }}"' -:${{ matrix.name }})" > MODULE.bazel
         echo "$(cat MODULE.bazel | buildozer 'set version "${{ steps.fetch-version.outputs.VERSION }}"' -:${{ matrix.name }})" > MODULE.bazel
 
-        sed -i"_orig" "s/${OLD_SHA}/${{ steps.fetch-version.outputs.SHA }}/" WORKSPACE
-        sed -i"_orig" "s/${OLD_VERSION}/${{ steps.fetch-version.outputs.VERSION }}/" WORKSPACE
-        rm *_orig
+        echo "MODULE.bazel updated"
 
         set -x
         git diff

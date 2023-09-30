@@ -427,6 +427,10 @@ end}.
 {mapping, "ssl_options.bypass_pem_cache", "ssl.bypass_pem_cache",
     [{datatype, {enum, [true, false]}}]}.
 
+
+{mapping, "metadata_store.khepri.default_timeout", "rabbit.khepri_default_timeout",
+    [{datatype, integer}]}.
+
 %% ===========================================================================
 
 %% Choose the available SASL mechanism(s) to expose.
@@ -782,6 +786,12 @@ end}.
     {datatype, string}
 ]}.
 
+{mapping, "default_policies.operator.$id.classic_queues.queue_version", "rabbit.default_policies.operator",
+    [
+        {validators, ["non_zero_positive_integer"]},
+        {datatype, integer}
+    ]}.
+
 {translation, "rabbit.default_policies.operator", fun(Conf) ->
     Props = rabbit_cuttlefish:aggregate_props(
                 Conf,
@@ -795,6 +805,8 @@ end}.
                               _ -> V
                           end,
                     {["default_policies","operator",ID|T], NewV};
+                   ({["default_policies","operator",ID, "queue_pattern"], V}) ->
+                    {["default_policies","operator",ID,"queue_pattern"], list_to_binary(V)};
                    (E) -> E
                 end),
     case Props of

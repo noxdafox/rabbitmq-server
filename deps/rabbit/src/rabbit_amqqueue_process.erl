@@ -611,20 +611,20 @@ send_or_record_confirm(#delivery{confirm    = false}, State) ->
 send_or_record_confirm(#delivery{confirm    = true,
                                  sender     = SenderPid,
                                  msg_seq_no = MsgSeqNo,
-                                 message    = #basic_message {
-                                   is_persistent = true,
-                                   id            = MsgId}},
+                                 message    = Message
+                                },
                        State = #q{q                 = Q,
-                                  msg_id_to_channel = MTC})
-  when ?amqqueue_is_durable(Q) ->
-    MTC1 = maps:put(MsgId, {SenderPid, MsgSeqNo}, MTC),
-    {eventually, State#q{msg_id_to_channel = MTC1}};
-send_or_record_confirm(#delivery{confirm    = true,
-                                 sender     = SenderPid,
-                                 msg_seq_no = MsgSeqNo},
-                       #q{q = Q} = State) ->
-    confirm_to_sender(SenderPid, amqqueue:get_name(Q), [MsgSeqNo]),
-    {immediately, State}.
+                                  msg_id_to_channel = MTC}) ->
+    Persistent = mc:is_persistent(Message),
+    MsgId = mc:get_annotation(id, Message),
+    case Persistent  of
+        true when ?amqqueue_is_durable(Q) ->
+            MTC1 = maps:put(MsgId, {SenderPid, MsgSeqNo}, MTC),
+            {eventually, State#q{msg_id_to_channel = MTC1}};
+        _ ->
+            confirm_to_sender(SenderPid, amqqueue:get_name(Q), [MsgSeqNo]),
+            {immediately, State}
+    end.
 
 %% This feature was used by `rabbit_amqqueue_process` and
 %% `rabbit_mirror_queue_slave` up-to and including RabbitMQ 3.7.x. It is
@@ -643,6 +643,7 @@ discard(#delivery{confirm = Confirm,
                   flow    = Flow,
                   message = Message}, BQ, BQS, MTC, QName) ->
     #basic_message{id = MsgId} = Message,
+    MsgId = mc:get_annotation(id, Message),
     MTC1 = case Confirm of
                true  -> confirm_messages([MsgId], MTC, QName);
                false -> MTC
@@ -810,12 +811,13 @@ send_reject_publish(#delivery{confirm = true,
                               sender = SenderPid,
                               flow = Flow,
                               msg_seq_no = MsgSeqNo,
-                              message = Message},
+                              message = Msg},
                       _Delivered,
                       State = #q{ q = Q,
                                   backing_queue = BQ,
                                   backing_queue_state = BQS,
                                   msg_id_to_channel   = MTC}) ->
+    MsgId = mc:get_annotation(id, Msg),
     ok = rabbit_classic_queue:send_rejection(SenderPid,
                                              amqqueue:get_name(Q), MsgSeqNo),
 
@@ -836,9 +838,8 @@ will_overflow(#delivery{message = Message},
                  backing_queue_state = BQS}) ->
     ExpectedQueueLength = BQ:len(BQS) + 1,
 
-    #basic_message{content = #content{payload_fragments_rev = PFR}} = Message,
-    MessageSize = iolist_size(PFR),
-    ExpectedQueueSizeBytes = BQ:info(message_bytes_ready, BQS) + MessageSize,
+    {_, PayloadSize} = mc:size(Message),
+    ExpectedQueueSizeBytes = BQ:info(message_bytes_ready, BQS) + PayloadSize,
 
     ExpectedQueueLength > MaxLen orelse ExpectedQueueSizeBytes > MaxBytes.
 
@@ -914,7 +915,7 @@ handle_ch_down(DownPid, State = #q{consumers                 = Consumers,
             {ok, State1};
         {ChAckTags, ChCTags, Consumers1} ->
             QName = qname(State1),
-            [emit_consumer_deleted(DownPid, CTag, QName, ?INTERNAL_USER) || CTag <- ChCTags],
+            [rabbit_core_metrics:consumer_deleted(DownPid, CTag, QName) || CTag <- ChCTags],
             Holder1 = new_single_active_consumer_after_channel_down(DownPid, Holder, SingleActiveConsumerOn, Consumers1),
             State2 = State1#q{consumers          = Consumers1,
                               active_consumer    = Holder1},
@@ -979,21 +980,18 @@ subtract_acks(ChPid, AckTags, State = #q{consumers = Consumers}, Fun) ->
                                    run_message_queue(true, Fun(State1))
     end.
 
-message_properties(Message = #basic_message{content = Content},
-                   Confirm, #q{ttl = TTL}) ->
-    #content{payload_fragments_rev = PFR} = Content,
+message_properties(Message, Confirm, #q{ttl = TTL}) ->
+    {_, Size} = mc:size(Message),
     #message_properties{expiry           = calculate_msg_expiry(Message, TTL),
                         needs_confirming = Confirm == eventually,
-                        size             = iolist_size(PFR)}.
+                        size             = Size}.
 
-calculate_msg_expiry(#basic_message{content = Content}, TTL) ->
-    #content{properties = Props} =
-        rabbit_binary_parser:ensure_content_decoded(Content),
-    %% We assert that the expiration must be valid - we check in the channel.
-    {ok, MsgTTL} = rabbit_basic:parse_expiration(Props),
+calculate_msg_expiry(Msg, TTL) ->
+    MsgTTL = mc:ttl(Msg),
     case lists:min([TTL, MsgTTL]) of
         undefined -> undefined;
-        T         -> os:system_time(microsecond) + T * 1000
+        T ->
+            os:system_time(microsecond) + T * 1000
     end.
 
 %% Logically this function should invoke maybe_send_drained/2.
@@ -1209,7 +1207,7 @@ emit_stats(State, Extra) ->
      {messages, M},
      {reductions, R},
      {name, Name} | Infos]
-    = [{K, V} || {K, V} <- infos(statistics_keys(), State),
+    = [{K, V} || {K, V} <- infos(statistics_keys() -- [backing_queue_status], State),
                  not lists:member(K, ExtraKs)],
     rabbit_core_metrics:queue_stats(Name, Extra ++ Infos),
     rabbit_core_metrics:queue_stats(Name, MR, MU, M, R).
@@ -1272,7 +1270,7 @@ prioritise_cast(Msg, _Len, State) ->
 
 consumer_bias(#q{backing_queue = BQ, backing_queue_state = BQS}, Low, High) ->
     case BQ:msg_rates(BQS) of
-        {0.0,          _} -> Low;
+        {Ingress,      _} when Ingress =:= +0.0 orelse Ingress =:= -0.0 -> Low;
         {Ingress, Egress} when Egress / Ingress < ?CONSUMER_BIAS_RATIO -> High;
         {_,            _} -> Low
     end.
@@ -1682,12 +1680,36 @@ handle_cast(policy_changed, State = #q{q = Q0}) ->
     Name = amqqueue:get_name(Q0),
     %% We depend on the #q.q field being up to date at least WRT
     %% policy (but not mirror pids) in various places, so when it
-    %% changes we go and read it from Mnesia again.
+    %% changes we go and read it from the database again.
     %%
     %% This also has the side effect of waking us up so we emit a
     %% stats event - so event consumers see the changed policy.
     {ok, Q} = rabbit_amqqueue:lookup(Name),
     noreply(process_args_policy(State#q{q = Q}));
+
+handle_cast({policy_changed, Q0}, State) ->
+    Name = amqqueue:get_name(Q0),
+    PolicyVersion0 = amqqueue:get_policy_version(Q0),
+    %% We depend on the #q.q field being up to date at least WRT
+    %% policy (but not mirror pids) in various places, so when it
+    %% changes we go and read it from the database again.
+    %%
+    %% This also has the side effect of waking us up so we emit a
+    %% stats event - so event consumers see the changed policy.
+    {ok, Q} = rabbit_amqqueue:lookup(Name),
+    PolicyVersion = amqqueue:get_policy_version(Q),
+    case PolicyVersion >= PolicyVersion0 of
+        true ->
+            noreply(process_args_policy(State#q{q = Q}));
+        false ->
+            %% Update just the policy, as pids and mirrors could have been
+            %% updated simultaneously. A testcase on the `confirm_rejects_SUITE`
+            %% fails consistently if the internal state is updated directly to `Q0`.
+            Q1 = amqqueue:set_policy(Q, amqqueue:get_policy(Q0)),
+            Q2 = amqqueue:set_operator_policy(Q1, amqqueue:get_operator_policy(Q0)),
+            Q3 = amqqueue:set_policy_version(Q2, PolicyVersion0),
+            noreply(process_args_policy(State#q{q = Q3}))
+    end;
 
 handle_cast({sync_start, _, _}, State = #q{q = Q}) ->
     Name = amqqueue:get_name(Q),

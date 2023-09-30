@@ -19,6 +19,7 @@
          connect/4,
          start_client/4,
          get_events/1,
+         get_events/2,
          assert_event_type/2,
          assert_event_prop/2,
          assert_message_expiry_interval/2,
@@ -104,6 +105,11 @@ get_events(Node) ->
     ?assert(is_list(Result)),
     Result.
 
+get_events(Node, Type) ->
+    lists:filter(fun(#event{type = T}) ->
+                         T == Type
+                 end, get_events(Node)).
+
 assert_event_type(ExpectedType, #event{type = ActualType}) ->
     ?assertEqual(ExpectedType, ActualType).
 
@@ -135,6 +141,10 @@ await_exit(Pid, Reason) ->
         20_000 -> ct:fail({missing_exit, Pid})
     end.
 
+maybe_skip_v5({skip, _Reason} = Skip) ->
+    %% Mixed-version can be skipped as `khepri_db`
+    %% is not supported
+    Skip;
 maybe_skip_v5(Config) ->
     case ?config(mqtt_version, Config) of
         v5 ->

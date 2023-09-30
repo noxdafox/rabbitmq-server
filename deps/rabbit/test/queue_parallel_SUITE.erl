@@ -8,13 +8,12 @@
 -module(queue_parallel_SUITE).
 
 -include_lib("common_test/include/ct.hrl").
--include_lib("kernel/include/file.hrl").
 -include_lib("amqp_client/include/amqp_client.hrl").
 -include_lib("eunit/include/eunit.hrl").
 
+-compile(nowarn_export_all).
 -compile(export_all).
 
--define(TIMEOUT, 30_000).
 
 all() ->
     [
@@ -57,7 +56,8 @@ groups() ->
                 purge,
                 purge_no_consumer,
                 basic_recover,
-                delete_immediately_by_resource
+                delete_immediately_by_resource,
+                cc_header_non_array_should_close_channel
                ],
     ExtraBccTests = [extra_bcc_option,
                      extra_bcc_option_multiple_1,
@@ -119,14 +119,20 @@ init_per_group(quorum_queue_in_memory_bytes, Config) ->
        {consumer_args, []},
        {queue_durable, true}]);
 init_per_group(mirrored_queue, Config) ->
-    rabbit_ct_broker_helpers:set_ha_policy(Config, 0, <<"^max_length.*queue">>,
-        <<"all">>, [{<<"ha-sync-mode">>, <<"automatic">>}]),
-    Config1 = rabbit_ct_helpers:set_config(
-                Config, [{is_mirrored, true},
-                         {queue_args, [{<<"x-queue-type">>, longstr, <<"classic">>}]},
-                         {consumer_args, []},
-                         {queue_durable, true}]),
-    rabbit_ct_helpers:run_steps(Config1, []);
+    case rabbit_ct_broker_helpers:configured_metadata_store(Config) of
+        mnesia ->
+            rabbit_ct_broker_helpers:set_ha_policy(
+              Config, 0, <<"^max_length.*queue">>,
+              <<"all">>, [{<<"ha-sync-mode">>, <<"automatic">>}]),
+            Config1 = rabbit_ct_helpers:set_config(
+                        Config, [{is_mirrored, true},
+                                 {queue_args, [{<<"x-queue-type">>, longstr, <<"classic">>}]},
+                                 {consumer_args, []},
+                                 {queue_durable, true}]),
+            rabbit_ct_helpers:run_steps(Config1, []);
+        {khepri, _} ->
+            {skip, "Classic queue mirroring not supported by Khepri"}
+    end;
 init_per_group(stream_queue, Config) ->
     rabbit_ct_helpers:set_config(
       Config,
@@ -670,6 +676,30 @@ delete_immediately_by_resource(Config) ->
                                               arguments = Args})),
     rabbit_ct_client_helpers:close_channel(Ch),
     ok.
+
+cc_header_non_array_should_close_channel(Config) ->
+    {C, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),
+    Name0 = ?FUNCTION_NAME,
+    Name = atom_to_binary(Name0),
+    QName = <<"queue_cc_header_non_array", Name/binary>>,
+    delete_queue(Ch, QName),
+    declare_queue(Ch, Config, QName),
+    amqp_channel:call(Ch,
+                       #'basic.publish'{exchange = <<"">>,
+                                        routing_key = QName},
+                       #amqp_msg{
+                          props = #'P_basic'{headers = [{<<"CC">>, long, 99}]},
+                          payload = <<"foo">>}),
+
+    Ref = erlang:monitor(process, Ch),
+    receive
+        {'DOWN', Ref, process, Ch, {shutdown, {server_initiated_close, 406, _}}} ->
+            ok
+    after 5000 ->
+              exit(channel_closed_timeout)
+    end,
+
+    ok = rabbit_ct_client_helpers:close_connection(C).
 
 extra_bcc_option(Config) ->
     {_, Ch} = rabbit_ct_client_helpers:open_connection_and_channel(Config, 0),

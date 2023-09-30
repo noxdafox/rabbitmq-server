@@ -10,7 +10,6 @@
 -ignore_xref([{maps, get, 2}]).
 
 -include("rabbit.hrl").
--include("rabbit_framing.hrl").
 -include("rabbit_misc.hrl").
 
 -include_lib("kernel/include/file.hrl").
@@ -21,7 +20,8 @@
 
 -export([method_record_type/1, polite_pause/0, polite_pause/1]).
 -export([die/1, frame_error/2, amqp_error/4, quit/1,
-         protocol_error/3, protocol_error/4, protocol_error/1]).
+         protocol_error/3, protocol_error/4, protocol_error/1,
+         precondition_failed/1, precondition_failed/2]).
 -export([type_class/1, assert_args_equivalence/4, assert_field_equivalence/4]).
 -export([table_lookup/2, set_table_value/4, amqp_table/1, to_amqp_table/1]).
 -export([r/3, r/2, r_arg/4, rs/1]).
@@ -79,10 +79,16 @@
 -export([raw_read_file/1]).
 -export([find_child/2]).
 -export([is_regular_file/1]).
--export([maps_any/2]).
 -export([safe_ets_update_counter/3, safe_ets_update_counter/4, safe_ets_update_counter/5,
          safe_ets_update_element/3, safe_ets_update_element/4, safe_ets_update_element/5]).
 -export([is_even/1, is_odd/1]).
+-export([is_valid_shortstr/1]).
+
+-export([maps_any/2,
+         maps_put_truthy/3,
+         maps_put_falsy/3
+        ]).
+-export([remote_sup_child/2]).
 
 %% Horrible macro to use in guards
 -define(IS_BENIGN_EXIT(R),
@@ -249,6 +255,8 @@
 -spec group_proplists_by(fun((proplists:proplist()) -> any()),
                          list(proplists:proplist())) -> list(list(proplists:proplist())).
 
+-spec precondition_failed(string()) -> no_return().
+-spec precondition_failed(string(), [any()]) -> no_return().
 
 %%----------------------------------------------------------------------------
 
@@ -281,6 +289,11 @@ protocol_error(Name, ExplanationFormat, Params, Method) ->
 
 protocol_error(#amqp_error{} = Error) ->
     exit(Error).
+
+precondition_failed(Format) -> precondition_failed(Format, []).
+
+precondition_failed(Format, Params) ->
+    protocol_error(precondition_failed, Format, Params).
 
 type_class(byte)          -> int;
 type_class(short)         -> int;
@@ -1437,18 +1450,10 @@ safe_ets_update_element(Tab, Key, ElementSpec, OnSuccess, OnFailure) ->
     false
   end.
 
-%% not exported by supervisor
--type supervisor_child_id() :: term().
--type supervisor_sup_ref() :: (Name :: atom())
-                            | {Name :: atom(), Node :: node()}
-                            | {'global', Name :: atom()}
-                            | {'via', Module :: module(), Name :: any()}
-                            | pid().
-
 %% this used to be in supervisor2
 -spec find_child(Supervisor, Name) -> [pid()] when
-      Supervisor :: supervisor_sup_ref(),
-      Name :: supervisor_child_id().
+      Supervisor :: rabbit_types:sup_ref(),
+      Name :: rabbit_types:child_id().
 find_child(Supervisor, Name) ->
     [Pid || {Name1, Pid, _Type, _Modules} <- supervisor:which_children(Supervisor),
             Name1 =:= Name].
@@ -1594,3 +1599,44 @@ is_even(N) ->
 -spec is_odd(integer()) -> boolean().
 is_odd(N) ->
     (N band 1) =:= 1.
+
+-spec is_valid_shortstr(term()) -> boolean().
+is_valid_shortstr(Bin) when byte_size(Bin) < 256 ->
+    is_utf8_no_null(Bin);
+is_valid_shortstr(_) ->
+    false.
+
+is_utf8_no_null(<<>>) ->
+    true;
+is_utf8_no_null(<<0, _/binary>>) ->
+    false;
+is_utf8_no_null(<<_/utf8, Rem/binary>>) ->
+    is_utf8_no_null(Rem);
+is_utf8_no_null(_) ->
+    false.
+
+-spec maps_put_truthy(Key, Value, Map) -> Map when
+      Map :: #{Key => Value}.
+maps_put_truthy(_K, undefined, M) ->
+    M;
+maps_put_truthy(_K, false, M) ->
+    M;
+maps_put_truthy(K, V, M) ->
+    maps:put(K, V, M).
+
+-spec maps_put_falsy(Key, Value, Map) -> Map when
+      Map :: #{Key => Value}.
+maps_put_falsy(K, undefined, M) ->
+    maps:put(K, undefined, M);
+maps_put_falsy(K, false, M) ->
+    maps:put(K, false, M);
+maps_put_falsy(_K, _V, M) ->
+    M.
+
+-spec remote_sup_child(node(), rabbit_types:sup_ref()) -> rabbit_types:ok_or_error2(rabbit_types:child(), no_child | no_sup).
+remote_sup_child(Node, Sup) ->
+    case rpc:call(Node, supervisor, which_children, [Sup]) of
+        [{_, Child, _, _}]              -> {ok, Child};
+        []                              -> {error, no_child};
+        {badrpc, {'EXIT', {noproc, _}}} -> {error, no_sup}
+    end.

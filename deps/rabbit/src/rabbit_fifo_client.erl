@@ -30,10 +30,9 @@
          pending_size/1,
          stat/1,
          stat/2,
-         query_single_active_consumer/1
+         query_single_active_consumer/1,
+         cluster_name/1
          ]).
-
--include_lib("rabbit_common/include/rabbit.hrl").
 
 -define(SOFT_LIMIT, 32).
 -define(TIMER_TIME, 10000).
@@ -46,7 +45,7 @@
                   rabbit_queue_type:action().
 -type actions() :: [action()].
 
--record(consumer, {last_msg_id :: seq() | -1,
+-record(consumer, {last_msg_id :: seq() | -1 | undefined,
                    ack = false :: boolean(),
                    delivery_count = 0 :: non_neg_integer()}).
 
@@ -118,37 +117,24 @@ enqueue(QName, Correlation, Msg,
                next_enqueue_seq = 1,
                cfg = #cfg{servers = Servers,
                           timeout = Timeout}} = State0) ->
-    %% it is the first enqueue, check the version
-    {_, Node} = pick_server(State0),
-    case rpc:call(Node, ra_machine, version, [{machine, rabbit_fifo, #{}}]) of
-        0 ->
-            %% the leader is running the old version
-            enqueue(QName, Correlation, Msg, State0#state{queue_status = go});
-        N when is_integer(N) ->
-            %% were running the new version on the leader do sync initialisation
-            %% of enqueuer session
-            Reg = rabbit_fifo:make_register_enqueuer(self()),
-            case ra:process_command(Servers, Reg, Timeout) of
-                {ok, reject_publish, Leader} ->
-                    {reject_publish, State0#state{leader = Leader,
-                                                  queue_status = reject_publish}};
-                {ok, ok, Leader} ->
-                    enqueue(QName, Correlation, Msg, State0#state{leader = Leader,
-                                                                  queue_status = go});
-                {error, {no_more_servers_to_try, _Errs}} ->
-                    %% if we are not able to process the register command
-                    %% it is safe to reject the message as we never attempted
-                    %% to send it
-                    {reject_publish, State0};
-                %% TODO: not convinced this can ever happen when using
-                %% a list of servers
-                {timeout, _} ->
-                    {reject_publish, State0};
-                Err ->
-                    exit(Err)
-            end;
-        {badrpc, nodedown} ->
-            {reject_publish, State0}
+    %% the first publish, register and enqueuer for this process.
+    Reg = rabbit_fifo:make_register_enqueuer(self()),
+    case ra:process_command(Servers, Reg, Timeout) of
+        {ok, reject_publish, Leader} ->
+            {reject_publish, State0#state{leader = Leader,
+                                          queue_status = reject_publish}};
+        {ok, ok, Leader} ->
+            enqueue(QName, Correlation, Msg, State0#state{leader = Leader,
+                                                          queue_status = go});
+        {error, {no_more_servers_to_try, _Errs}} ->
+            %% if we are not able to process the register command
+            %% it is safe to reject the message as we never attempted
+            %% to send it
+            {reject_publish, State0};
+        {timeout, _} ->
+            {reject_publish, State0};
+        Err ->
+            exit(Err)
     end;
 enqueue(_QName, _Correlation, _Msg,
         #state{queue_status = reject_publish,
@@ -161,10 +147,10 @@ enqueue(QName, Correlation, Msg,
                next_seq = Seq,
                next_enqueue_seq = EnqueueSeq,
                cfg = #cfg{soft_limit = SftLmt}} = State0) ->
-    Server = pick_server(State0),
+    ServerId = pick_server(State0),
     % by default there is no correlation id
     Cmd = rabbit_fifo:make_enqueue(self(), EnqueueSeq, Msg),
-    ok = ra:pipeline_command(Server, Cmd, Seq, low),
+    ok = ra:pipeline_command(ServerId, Cmd, Seq, low),
     Tag = case map_size(Pending) >= SftLmt of
               true -> slow;
               false -> ok
@@ -213,9 +199,9 @@ enqueue(QName, Msg, State) ->
      | {empty, state()} | {error | timeout, term()}.
 dequeue(QueueName, ConsumerTag, Settlement,
         #state{cfg = #cfg{timeout = Timeout}} = State0) ->
-    Node = pick_server(State0),
+    ServerId = pick_server(State0),
     ConsumerId = consumer_id(ConsumerTag),
-    case ra:process_command(Node,
+    case ra:process_command(ServerId,
                             rabbit_fifo:make_checkout(ConsumerId,
                                                       {dequeue, Settlement},
                                                       #{}),
@@ -238,12 +224,14 @@ dequeue(QueueName, ConsumerTag, Settlement,
             Err
     end.
 
-add_delivery_count_header(#basic_message{} = Msg0, Count)
-  when is_integer(Count) andalso
-       Count > 0 ->
-    rabbit_basic:add_header(<<"x-delivery-count">>, long, Count, Msg0);
-add_delivery_count_header(Msg, _Count) ->
-    Msg.
+add_delivery_count_header(Msg, Count) ->
+    case mc:is(Msg) of
+        true when is_integer(Count) andalso
+                  Count > 0 ->
+            mc:set_annotation(<<"x-delivery-count">>, Count, Msg);
+        _ ->
+            Msg
+    end.
 
 
 %% @doc Settle a message. Permanently removes message from the queue.
@@ -254,9 +242,9 @@ add_delivery_count_header(Msg, _Count) ->
 -spec settle(rabbit_fifo:consumer_tag(), [rabbit_fifo:msg_id()], state()) ->
     {state(), list()}.
 settle(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
-    Node = pick_server(State0),
+    ServerId = pick_server(State0),
     Cmd = rabbit_fifo:make_settle(consumer_id(ConsumerTag), MsgIds),
-    {send_command(Node, undefined, Cmd, normal, State0), []};
+    {send_command(ServerId, undefined, Cmd, normal, State0), []};
 settle(ConsumerTag, [_|_] = MsgIds,
        #state{unsent_commands = Unsent0} = State0) ->
     ConsumerId = consumer_id(ConsumerTag),
@@ -282,10 +270,10 @@ settle(ConsumerTag, [_|_] = MsgIds,
 -spec return(rabbit_fifo:consumer_tag(), [rabbit_fifo:msg_id()], state()) ->
     {state(), list()}.
 return(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
-    Node = pick_server(State0),
+    ServerId = pick_server(State0),
     % TODO: make rabbit_fifo return support lists of message ids
     Cmd = rabbit_fifo:make_return(consumer_id(ConsumerTag), MsgIds),
-    {send_command(Node, undefined, Cmd, normal, State0), []};
+    {send_command(ServerId, undefined, Cmd, normal, State0), []};
 return(ConsumerTag, [_|_] = MsgIds,
        #state{unsent_commands = Unsent0} = State0) ->
     ConsumerId = consumer_id(ConsumerTag),
@@ -307,9 +295,9 @@ return(ConsumerTag, [_|_] = MsgIds,
 -spec discard(rabbit_fifo:consumer_tag(), [rabbit_fifo:msg_id()], state()) ->
     {state(), list()}.
 discard(ConsumerTag, [_|_] = MsgIds, #state{slow = false} = State0) ->
-    Node = pick_server(State0),
+    ServerId = pick_server(State0),
     Cmd = rabbit_fifo:make_discard(consumer_id(ConsumerTag), MsgIds),
-    {send_command(Node, undefined, Cmd, normal, State0), []};
+    {send_command(ServerId, undefined, Cmd, normal, State0), []};
 discard(ConsumerTag, [_|_] = MsgIds,
         #state{unsent_commands = Unsent0} = State0) ->
     ConsumerId = consumer_id(ConsumerTag),
@@ -359,8 +347,20 @@ checkout(ConsumerTag, NumUnsettled, CreditMode, Meta,
                                 %% this is the pre 3.11.1 / 3.10.9
                                 %% reply format
                                 -1;
-                            {ok, #{next_msg_id := NextMsgId}} ->
-                                NextMsgId - 1
+                            {ok, #{num_checked_out := NumChecked,
+                                   next_msg_id := NextMsgId}} ->
+                                case NumChecked > 0 of
+                                    true ->
+                                        %% we cannot know if the pending messages
+                                        %% have been delivered to the client or they
+                                        %% are on their way to the current process.
+                                        %% We set `undefined' to signal this uncertainty
+                                        %% and will just accept the next arriving message
+                                        %% irrespective of message id
+                                        undefined;
+                                    false ->
+                                        NextMsgId - 1
+                                end
                         end,
             SDels = maps:update_with(
                       ConsumerTag, fun (C) -> C#consumer{ack = Ack} end,
@@ -404,10 +404,10 @@ credit(ConsumerTag, Credit, Drain,
     %% the last received msgid provides us with the delivery count if we
     %% add one as it is 0 indexed
     C = maps:get(ConsumerTag, CDels, #consumer{last_msg_id = -1}),
-    Node = pick_server(State0),
+    ServerId = pick_server(State0),
     Cmd = rabbit_fifo:make_credit(ConsumerId, Credit,
                                   C#consumer.last_msg_id + 1, Drain),
-    {send_command(Node, undefined, Cmd, normal, State0), []}.
+    {send_command(ServerId, undefined, Cmd, normal, State0), []}.
 
 %% @doc Cancels a checkout with the rabbit_fifo queue  for the consumer tag
 %%
@@ -560,10 +560,10 @@ handle_ra_event(QName, From, {applied, Seqs},
                                                          add_command(Cid, discard,
                                                                      Discards, Acc)))
                          end, [], State1#state.unsent_commands),
-            Node = pick_server(State2),
+            ServerId = pick_server(State2),
             %% send all the settlements and returns
             State = lists:foldl(fun (C, S0) ->
-                                        send_command(Node, undefined, C,
+                                        send_command(ServerId, undefined, C,
                                                      normal, S0)
                                 end, State2, Commands),
             {ok, State, [{unblock, cluster_name(State)} | Actions]};
@@ -624,9 +624,9 @@ handle_ra_event(_QName, _Leader, {machine, eol}, State) ->
 %% @returns `ok'
 -spec untracked_enqueue([ra:server_id()], term()) ->
     ok.
-untracked_enqueue([Node | _], Msg) ->
+untracked_enqueue([ServerId | _], Msg) ->
     Cmd = rabbit_fifo:make_enqueue(undefined, undefined, Msg),
-    ok = ra:pipeline_command(Node, Cmd),
+    ok = ra:pipeline_command(ServerId, Cmd),
     ok.
 
 %% Internal
@@ -713,7 +713,11 @@ handle_delivery(QName, Leader, {delivery, Tag, [{FstId, _} | _] = IdMsgs},
     %% TODO: remove potential default allocation
     case Consumer of
         #consumer{last_msg_id = Prev} = C
-          when FstId =:= Prev+1 ->
+          when Prev =:= undefined orelse FstId =:= Prev+1 ->
+            %% Prev =:= undefined is a special case where a checkout was done
+            %% for a previously cancelled consumer that still had pending messages
+            %% In this case we can't reliably know what the next expected message
+            %% id should be so have to accept whatever message comes next
             maybe_auto_ack(Ack, Del,
                            State0#state{consumer_deliveries =
                                         update_consumer(Tag, LastId,
@@ -777,6 +781,7 @@ transform_msgs(QName, QRef, Msgs) ->
                                        _ ->
                                            {Msg0, false}
                                    end,
+
               {QName, QRef, MsgId, Redelivered, Msg}
       end, Msgs).
 
@@ -851,10 +856,10 @@ send_command(Server, Correlation, Command, Priority,
                 next_seq = Seq + 1,
                 slow = Tag == slow}.
 
-resend_command(Node, Correlation, Command,
+resend_command(ServerId, Correlation, Command,
                #state{pending = Pending,
                       next_seq = Seq} = State) ->
-    ok = ra:pipeline_command(Node, Command, Seq),
+    ok = ra:pipeline_command(ServerId, Command, Seq),
     State#state{pending = Pending#{Seq => {Correlation, Command}},
                 next_seq = Seq + 1}.
 

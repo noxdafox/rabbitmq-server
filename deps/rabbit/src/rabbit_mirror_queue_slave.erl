@@ -105,6 +105,7 @@ handle_go(Q0) when ?is_amqqueue(Q0) ->
     %% above.
     %%
     process_flag(trap_exit, true), %% amqqueue_process traps exits too.
+    %% TODO handle gm transactions!!!
     {ok, GM} = gm:start_link(QName, ?MODULE, [self()],
                              fun rabbit_mnesia:execute_mnesia_transaction/1),
     MRef = erlang:monitor(process, GM),
@@ -118,8 +119,7 @@ handle_go(Q0) when ?is_amqqueue(Q0) ->
     end,
     Self = self(),
     Node = node(),
-    case rabbit_mnesia:execute_mnesia_transaction(
-           fun() -> init_it(Self, GM, Node, QName) end) of
+    case init_it(Self, GM, Node, QName) of
         {new, QPid, GMPids} ->
             ok = file_handle_cache:register_callback(
                    rabbit_amqqueue, set_maximum_since_use, [Self]),
@@ -146,7 +146,7 @@ handle_go(Q0) when ?is_amqqueue(Q0) ->
                    },
             ok = gm:broadcast(GM, request_depth),
             ok = gm:validate_members(GM, [GM | [G || {G, _} <- GMPids]]),
-            rabbit_mirror_queue_misc:maybe_auto_sync(Q1),
+            _ = rabbit_mirror_queue_misc:maybe_auto_sync(Q1),
             {ok, State};
         {stale, StalePid} ->
             rabbit_mirror_queue_misc:log_warning(
@@ -169,6 +169,21 @@ handle_go(Q0) when ?is_amqqueue(Q0) ->
     end.
 
 init_it(Self, GM, Node, QName) ->
+    rabbit_khepri:handle_fallback(
+      #{mnesia =>
+            fun() ->
+                    rabbit_mnesia:execute_mnesia_transaction(
+                      fun() -> init_it_in_mnesia(Self, GM, Node, QName) end)
+            end,
+        khepri =>
+            fun() ->
+                    rabbit_khepri:transaction(
+                      fun() -> init_it_in_khepri(Self, GM, Node, QName) end,
+                      rw)
+            end
+       }).
+
+init_it_in_mnesia(Self, GM, Node, QName) ->
     case mnesia:read({rabbit_queue, QName}) of
         [Q] when ?is_amqqueue(Q) ->
             QPid = amqqueue:get_pid(Q),
@@ -179,6 +194,38 @@ init_it(Self, GM, Node, QName) ->
                 []     -> _ = stop_pending_slaves(QName, PSPids),
                           _ = add_slave(Q, Self, GM),
                           {new, QPid, GMPids};
+                [QPid] -> case rabbit_mnesia:is_process_alive(QPid) of
+                              true  -> duplicate_live_master;
+                              false -> {stale, QPid}
+                          end;
+                [SPid] -> case rabbit_mnesia:is_process_alive(SPid) of
+                              true  -> existing;
+                              false -> GMPids1 = [T || T = {_, S} <- GMPids, S =/= SPid],
+                                       SPids1 = SPids -- [SPid],
+                                       Q1 = amqqueue:set_slave_pids(Q, SPids1),
+                                       Q2 = amqqueue:set_gm_pids(Q1, GMPids1),
+                                       _ = add_slave(Q2, Self, GM),
+                                       {new, QPid, GMPids1}
+                          end
+            end;
+        [] ->
+            master_in_recovery
+    end.
+
+init_it_in_khepri(Self, GM, Node, QName) ->
+    case rabbit_db_queue:get_in_khepri_tx(QName) of
+        [Q] when ?is_amqqueue(Q) ->
+            QPid = amqqueue:get_pid(Q),
+            SPids = amqqueue:get_slave_pids(Q),
+            GMPids = amqqueue:get_gm_pids(Q),
+            PSPids = amqqueue:get_slave_pids_pending_shutdown(Q),
+            %% TODO we can't kill processes!
+            case [Pid || Pid <- [QPid | SPids], node(Pid) =:= Node] of
+                []     -> _ = stop_pending_slaves(QName, PSPids),
+                          %% TODO make add_slave_in_khepri and add_slave_in_mnesia
+                          _ = add_slave(Q, Self, GM),
+                          {new, QPid, GMPids};
+                %% TODO is_process_alive should never go on a khepri transaction!
                 [QPid] -> case rabbit_mnesia:is_process_alive(QPid) of
                               true  -> duplicate_live_master;
                               false -> {stale, QPid}
@@ -563,21 +610,24 @@ send_mandatory(#delivery{mandatory  = true,
 
 send_or_record_confirm(_, #delivery{ confirm = false }, MS, _State) ->
     MS;
-send_or_record_confirm(published, #delivery { sender     = ChPid,
+send_or_record_confirm(Status, #delivery { sender     = ChPid,
                                               confirm    = true,
                                               msg_seq_no = MsgSeqNo,
-                                              message    = #basic_message {
-                                                id            = MsgId,
-                                                is_persistent = true } },
-                       MS, #state{q = Q}) when ?amqqueue_is_durable(Q) ->
-    maps:put(MsgId, {published, ChPid, MsgSeqNo} , MS);
-send_or_record_confirm(_Status, #delivery { sender     = ChPid,
-                                            confirm    = true,
-                                            msg_seq_no = MsgSeqNo },
-                       MS, #state{q = Q} = _State) ->
-    ok = rabbit_classic_queue:confirm_to_sender(ChPid,
-                                                amqqueue:get_name(Q), [MsgSeqNo]),
-    MS.
+                                              message    = Msg
+                                            },
+                       MS, #state{q = Q}) ->
+    MsgId = mc:get_annotation(id, Msg),
+    IsPersistent = mc:is_persistent(Msg),
+    case IsPersistent of
+        true when ?amqqueue_is_durable(Q) andalso
+                  Status == published ->
+            maps:put(MsgId, {published, ChPid, MsgSeqNo}, MS);
+        _ ->
+            ok = rabbit_classic_queue:confirm_to_sender(ChPid,
+                                                        amqqueue:get_name(Q),
+                                                        [MsgSeqNo]),
+            MS
+    end.
 
 confirm_messages(MsgIds, State = #state{q = Q, msg_id_status = MS}) ->
     QName = amqqueue:get_name(Q),
@@ -847,9 +897,10 @@ maybe_forget_sender(ChPid, ChState, State = #state { sender_queues = SQ,
     end.
 
 maybe_enqueue_message(
-  Delivery = #delivery { message = #basic_message { id = MsgId },
+  Delivery = #delivery { message = Msg,
                          sender  = ChPid },
   State = #state { sender_queues = SQ, msg_id_status = MS }) ->
+    MsgId = mc:get_annotation(id, Msg),
     send_mandatory(Delivery), %% must do this before confirms
     State1 = ensure_monitoring(ChPid, State),
     %% We will never see {published, ChPid, MsgSeqNo} here.
@@ -897,25 +948,28 @@ publish_or_discard(Status, ChPid, MsgId,
                 {MQ, sets:add_element(MsgId, PendingCh),
                  maps:put(MsgId, Status, MS)};
             {{value, Delivery = #delivery {
-                       message = #basic_message { id = MsgId } }}, MQ2} ->
-                {MQ2, PendingCh,
-                 %% We received the msg from the channel first. Thus
-                 %% we need to deal with confirms here.
-                 send_or_record_confirm(Status, Delivery, MS, State1)};
-            {{value, #delivery {}}, _MQ2} ->
-                %% The instruction was sent to us before we were
-                %% within the slave_pids within the #amqqueue{}
-                %% record. We'll never receive the message directly
-                %% from the channel. And the channel will not be
-                %% expecting any confirms from us.
-                {MQ, PendingCh, MS}
+                       message = Msg }}, MQ2} ->
+                case mc:get_annotation(id, Msg) of
+                    MsgId ->
+                        {MQ2, PendingCh,
+                         %% We received the msg from the channel first. Thus
+                         %% we need to deal with confirms here.
+                         send_or_record_confirm(Status, Delivery, MS, State1)};
+                    _ ->
+                        %% The instruction was sent to us before we were
+                        %% within the slave_pids within the #amqqueue{}
+                        %% record. We'll never receive the message directly
+                        %% from the channel. And the channel will not be
+                        %% expecting any confirms from us.
+                        {MQ, PendingCh, MS}
+                end
         end,
     SQ1 = maps:put(ChPid, {MQ1, PendingCh1, ChState}, SQ),
     State1 #state { sender_queues = SQ1, msg_id_status = MS1 }.
 
 
-process_instruction({publish, ChPid, Flow, MsgProps,
-                     Msg = #basic_message { id = MsgId }}, State) ->
+process_instruction({publish, ChPid, Flow, MsgProps, Msg}, State) ->
+    MsgId = mc:get_annotation(id, Msg),
     maybe_flow_ack(ChPid, Flow),
     State1 = #state { backing_queue = BQ, backing_queue_state = BQS } =
         publish_or_discard(published, ChPid, MsgId, State),
@@ -924,14 +978,14 @@ process_instruction({publish, ChPid, Flow, MsgProps,
 process_instruction({batch_publish, ChPid, Flow, Publishes}, State) ->
     maybe_flow_ack(ChPid, Flow),
     State1 = #state { backing_queue = BQ, backing_queue_state = BQS } =
-        lists:foldl(fun ({#basic_message { id = MsgId },
-                          _MsgProps, _IsDelivered}, St) ->
+        lists:foldl(fun ({Msg, _MsgProps, _IsDelivered}, St) ->
+                            MsgId = mc:get_annotation(id, Msg),
                             publish_or_discard(published, ChPid, MsgId, St)
                     end, State, Publishes),
     BQS1 = BQ:batch_publish(Publishes, ChPid, Flow, BQS),
     {ok, State1 #state { backing_queue_state = BQS1 }};
-process_instruction({publish_delivered, ChPid, Flow, MsgProps,
-                     Msg = #basic_message { id = MsgId }}, State) ->
+process_instruction({publish_delivered, ChPid, Flow, MsgProps, Msg}, State) ->
+    MsgId = mc:get_annotation(id, Msg),
     maybe_flow_ack(ChPid, Flow),
     State1 = #state { backing_queue = BQ, backing_queue_state = BQS } =
         publish_or_discard(published, ChPid, MsgId, State),
@@ -943,8 +997,9 @@ process_instruction({batch_publish_delivered, ChPid, Flow, Publishes}, State) ->
     maybe_flow_ack(ChPid, Flow),
     {MsgIds,
      State1 = #state { backing_queue = BQ, backing_queue_state = BQS }} =
-        lists:foldl(fun ({#basic_message { id = MsgId }, _MsgProps},
+        lists:foldl(fun ({Msg, _MsgProps},
                          {MsgIds, St}) ->
+                            MsgId = mc:get_annotation(id, Msg),
                             {[MsgId | MsgIds],
                              publish_or_discard(published, ChPid, MsgId, St)}
                     end, {[], State}, Publishes),

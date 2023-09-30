@@ -19,7 +19,7 @@ rules_pkg_dependencies()
 git_repository(
     name = "rules_erlang",
     remote = "https://github.com/rabbitmq/rules_erlang.git",
-    tag = "3.11.3",
+    tag = "3.12.0",
 )
 
 load("@rules_erlang//:internal_deps.bzl", "rules_erlang_internal_deps")
@@ -100,103 +100,17 @@ http_file(
 
 http_file(
     name = "otp_src_25_3",
-    downloaded_file_path = "OTP-25.3.2.4.tar.gz",
-    sha256 = "a516620a94afc1d10923f58691d88849115b405199102d74461ba0081c29eba6",
-    urls = ["https://github.com/erlang/otp/archive/OTP-25.3.2.4.tar.gz"],
+    downloaded_file_path = "OTP-25.3.2.6.tar.gz",
+    sha256 = "67e0f5c209a335cfc216a57b1f016072a69eb9683d36d6d101bf2f60a2e45926",
+    urls = ["https://github.com/erlang/otp/archive/OTP-25.3.2.6.tar.gz"],
 )
 
 http_file(
-    name = "otp_src_26",
-    downloaded_file_path = "OTP-26.0.2.tar.gz",
-    sha256 = "4def5ed5e49815fb02fceae8a66e94abc1049f5de30f97d9ad12fdf3293a2470",
-    urls = ["https://github.com/erlang/otp/archive/OTP-26.0.2.tar.gz"],
+    name = "otp_src_26_1",
+    downloaded_file_path = "OTP-26.1.1.tar.gz",
+    sha256 = "a47203930e4b34a0e23bdf0a968127e5ec9d0e6c69ccf2e53be81cd2360eee2d",
+    urls = ["https://github.com/erlang/otp/archive/OTP-26.1.1.tar.gz"],
 )
-
-load(
-    "@rules_erlang//:rules_erlang.bzl",
-    "erlang_config",
-    "internal_erlang_from_github_release",
-    "internal_erlang_from_http_archive",
-)
-
-erlang_config(
-    internal_erlang_configs = [
-        internal_erlang_from_github_release(
-            name = "24",
-            sha256 = "8444ff9abe23aea268adbb95463561fc222c965052d35d7c950b17be01c3ad82",
-            version = "24.3.4.6",
-        ),
-        internal_erlang_from_github_release(
-            name = "25_0",
-            sha256 = "8fc707f92a124b2aeb0f65dcf9ac8e27b2a305e7bcc4cc1b2fdf770eec0165bf",
-            version = "25.0.4",
-        ),
-        internal_erlang_from_github_release(
-            name = "25_1",
-            sha256 = "1cd2fbe225a412009cda9b1fd9f3fff0293e75e3020daa48abf68721471e91eb",
-            version = "25.1.2.1",
-        ),
-        internal_erlang_from_github_release(
-            name = "25_2",
-            sha256 = "f4d9f11d67ba478a053d72e635a44722a975603fe1284063fdf38276366bc61c",
-            version = "25.2.3",
-        ),
-        internal_erlang_from_github_release(
-            name = "25_3",
-            sha256 = "9d224c098abbb48fbe42abb81bd04765efa2190d9eae4898f78183d9725a676b",
-            version = "25.3.2.4",
-        ),
-        internal_erlang_from_github_release(
-            name = "26",
-            sha256 = "4def5ed5e49815fb02fceae8a66e94abc1049f5de30f97d9ad12fdf3293a2470",
-            version = "26.0.2",
-        ),
-        internal_erlang_from_http_archive(
-            name = "git_master",
-            strip_prefix = "otp-master",
-            url = "https://github.com/erlang/otp/archive/refs/heads/master.tar.gz",
-            version = "27",
-        ),
-    ],
-)
-
-load("@erlang_config//:defaults.bzl", "register_defaults")
-
-register_defaults()
-
-load(
-    "//bazel/elixir:elixir.bzl",
-    "elixir_config",
-    "internal_elixir_from_github_release",
-)
-
-elixir_config(
-    internal_elixir_configs = [
-        internal_elixir_from_github_release(
-            name = "1_13",
-            sha256 = "95daf2dd3052e6ca7d4d849457eaaba09de52d65ca38d6933c65bc1cdf6b8579",
-            version = "1.13.4",
-        ),
-        internal_elixir_from_github_release(
-            name = "1_14",
-            sha256 = "2ea249566c67e57f8365ecdcd0efd9b6c375f57609b3ac2de326488ac37c8ebd",
-            version = "1.14.5",
-        ),
-        internal_elixir_from_github_release(
-            name = "1_15",
-            sha256 = "3cfadca57c3092ccbd3ec3f17e5eab529bbd2946f50e4941a903c55c39e3c5f5",
-            version = "1.15.2",
-        ),
-    ],
-    rabbitmq_server_workspace = "@",
-)
-
-load(
-    "@elixir_config//:defaults.bzl",
-    register_elixir_defaults = "register_defaults",
-)
-
-register_elixir_defaults()
 
 new_git_repository(
     name = "bats",

@@ -26,7 +26,6 @@
 
 -behaviour(rabbit_backing_queue).
 
--include_lib("rabbit_common/include/rabbit.hrl").
 -include("amqqueue.hrl").
 
 -record(state, { name,
@@ -94,19 +93,7 @@ init_with_existing_bq(Q0, BQ, BQS) when ?is_amqqueue(Q0) ->
     {ok, CPid} ->
         GM = rabbit_mirror_queue_coordinator:get_gm(CPid),
         Self = self(),
-        Fun = fun () ->
-                  [Q1] = mnesia:read({rabbit_queue, QName}),
-                  true = amqqueue:is_amqqueue(Q1),
-                  GMPids0 = amqqueue:get_gm_pids(Q1),
-                  GMPids1 = [{GM, Self} | GMPids0],
-                  Q2 = amqqueue:set_gm_pids(Q1, GMPids1),
-                  Q3 = amqqueue:set_state(Q2, live),
-                  %% amqqueue migration:
-                  %% The amqqueue was read from this transaction, no
-                  %% need to handle migration.
-                  ok = rabbit_amqqueue:store_queue(Q3)
-              end,
-        ok = rabbit_mnesia:execute_mnesia_transaction(Fun),
+        migrate_queue_record(QName, GM, Self),
         {_MNode, SNodes} = rabbit_mirror_queue_misc:suggested_queue_nodes(Q0),
         %% We need synchronous add here (i.e. do not return until the
         %% mirror is running) so that when queue declaration is finished
@@ -131,6 +118,44 @@ init_with_existing_bq(Q0, BQ, BQS) when ?is_amqqueue(Q0) ->
         % is trapping exists
         throw({coordinator_not_started, Reason})
     end.
+
+migrate_queue_record(QName, GM, Self) ->
+    rabbit_khepri:handle_fallback(
+      #{mnesia => fun() -> migrate_queue_record_in_mnesia(QName, GM, Self) end,
+        khepri => fun() -> migrate_queue_record_in_khepri(QName, GM, Self) end
+       }).
+
+migrate_queue_record_in_mnesia(QName, GM, Self) ->
+    Fun = fun () ->
+                  [Q1] = mnesia:read({rabbit_queue, QName}),
+                  true = amqqueue:is_amqqueue(Q1),
+                  GMPids0 = amqqueue:get_gm_pids(Q1),
+                  GMPids1 = [{GM, Self} | GMPids0],
+                  Q2 = amqqueue:set_gm_pids(Q1, GMPids1),
+                  Q3 = amqqueue:set_state(Q2, live),
+                  %% amqqueue migration:
+                  %% The amqqueue was read from this transaction, no
+                  %% need to handle migration.
+                  ok = rabbit_amqqueue:store_queue(Q3)
+          end,
+    ok = rabbit_mnesia:execute_mnesia_transaction(Fun).
+
+migrate_queue_record_in_khepri(QName, GM, Self) ->
+    Fun = fun () ->
+                  rabbit_db_queue:update_in_khepri_tx(
+                    QName,
+                    fun(Q1) ->
+                            GMPids0 = amqqueue:get_gm_pids(Q1),
+                            GMPids1 = [{GM, Self} | GMPids0],
+                            Q2 = amqqueue:set_gm_pids(Q1, GMPids1),
+                            amqqueue:set_state(Q2, live)
+                            %% Todo it's missing the decorators, but HA is not supported
+                            %% in khepri. This just makes things compile and maybe
+                            %% start HA queues
+                    end)
+          end,
+    _ = rabbit_khepri:transaction(Fun, rw),
+    ok.
 
 -spec stop_mirroring(master_state()) -> {atom(), any()}.
 
@@ -232,14 +257,17 @@ purge(State = #state { gm                  = GM,
 -spec purge_acks(_) -> no_return().
 purge_acks(_State) -> exit({not_implemented, {?MODULE, purge_acks}}).
 
-publish(Msg = #basic_message { id = MsgId }, MsgProps, IsDelivered, ChPid, Flow,
+publish(Msg, MsgProps, IsDelivered, ChPid, Flow,
         State = #state { gm                  = GM,
                          seen_status         = SS,
                          backing_queue       = BQ,
                          backing_queue_state = BQS }) ->
+    MsgId = mc:get_annotation(id, Msg),
+    {_, Size} = mc:size(Msg),
+
     false = maps:is_key(MsgId, SS), %% ASSERTION
     ok = gm:broadcast(GM, {publish, ChPid, Flow, MsgProps, Msg},
-                      rabbit_basic:msg_size(Msg)),
+                      Size),
     BQS1 = BQ:publish(Msg, MsgProps, IsDelivered, ChPid, Flow, BQS),
     ensure_monitoring(ChPid, State #state { backing_queue_state = BQS1 }).
 
@@ -249,11 +277,13 @@ batch_publish(Publishes, ChPid, Flow,
                                backing_queue       = BQ,
                                backing_queue_state = BQS }) ->
     {Publishes1, false, MsgSizes} =
-        lists:foldl(fun ({Msg = #basic_message { id = MsgId },
+        lists:foldl(fun ({Msg,
                           MsgProps, _IsDelivered}, {Pubs, false, Sizes}) ->
+                            MsgId = mc:get_annotation(id, Msg),
+                            {_, Size} = mc:size(Msg),
                             {[{Msg, MsgProps, true} | Pubs], %% [0]
                              false = maps:is_key(MsgId, SS), %% ASSERTION
-                             Sizes + rabbit_basic:msg_size(Msg)}
+                             Sizes + Size}
                     end, {[], false, 0}, Publishes),
     Publishes2 = lists:reverse(Publishes1),
     ok = gm:broadcast(GM, {batch_publish, ChPid, Flow, Publishes2},
@@ -264,14 +294,16 @@ batch_publish(Publishes, ChPid, Flow,
 %% IsDelivered flag to true, so to avoid iterating over the messages
 %% again at the mirror, we do it here.
 
-publish_delivered(Msg = #basic_message { id = MsgId }, MsgProps,
+publish_delivered(Msg, MsgProps,
                   ChPid, Flow, State = #state { gm                  = GM,
                                                 seen_status         = SS,
                                                 backing_queue       = BQ,
                                                 backing_queue_state = BQS }) ->
+    MsgId = mc:get_annotation(id, Msg),
+    {_, Size} = mc:size(Msg),
     false = maps:is_key(MsgId, SS), %% ASSERTION
     ok = gm:broadcast(GM, {publish_delivered, ChPid, Flow, MsgProps, Msg},
-                      rabbit_basic:msg_size(Msg)),
+                      Size),
     {AckTag, BQS1} = BQ:publish_delivered(Msg, MsgProps, ChPid, Flow, BQS),
     State1 = State #state { backing_queue_state = BQS1 },
     {AckTag, ensure_monitoring(ChPid, State1)}.
@@ -282,10 +314,12 @@ batch_publish_delivered(Publishes, ChPid, Flow,
                                          backing_queue       = BQ,
                                          backing_queue_state = BQS }) ->
     {false, MsgSizes} =
-        lists:foldl(fun ({Msg = #basic_message { id = MsgId }, _MsgProps},
+        lists:foldl(fun ({Msg, _MsgProps},
                          {false, Sizes}) ->
+                            MsgId = mc:get_annotation(id, Msg),
+                            {_, Size} = mc:size(Msg),
                             {false = maps:is_key(MsgId, SS), %% ASSERTION
-                             Sizes + rabbit_basic:msg_size(Msg)}
+                             Sizes + Size}
                     end, {false, 0}, Publishes),
     ok = gm:broadcast(GM, {batch_publish_delivered, ChPid, Flow, Publishes},
                       MsgSizes),
@@ -444,11 +478,12 @@ invoke(Mod, Fun, State = #state { backing_queue       = BQ,
                                   backing_queue_state = BQS }) ->
     State #state { backing_queue_state = BQ:invoke(Mod, Fun, BQS) }.
 
-is_duplicate(Message = #basic_message { id = MsgId },
+is_duplicate(Message,
              State = #state { seen_status         = SS,
                               backing_queue       = BQ,
                               backing_queue_state = BQS,
                               confirmed           = Confirmed }) ->
+    MsgId = mc:get_annotation(id, Message),
     %% Here, we need to deal with the possibility that we're about to
     %% receive a message that we've already seen when we were a mirror
     %% (we received it via gm). Thus if we do receive such message now

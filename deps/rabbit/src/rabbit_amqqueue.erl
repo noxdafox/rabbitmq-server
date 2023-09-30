@@ -11,15 +11,15 @@
 -export([recover/1, stop/1, start/1, declare/6, declare/7,
          delete_immediately/1, delete_exclusive/2, delete/4, purge/1,
          forget_all_durable/1]).
--export([pseudo_queue/2, pseudo_queue/3, immutable/1]).
+-export([pseudo_queue/2, pseudo_queue/3]).
 -export([exists/1, lookup/1, lookup/2, lookup_many/1, lookup_durable_queue/1,
          not_found_or_absent_dirty/1,
          with/2, with/3, with_or_die/2,
          assert_equivalence/5,
          augment_declare_args/5,
          check_exclusive_access/2, with_exclusive_access_or_die/3,
-         stat/1, deliver/2,
-         requeue/3, ack/3, reject/4]).
+         stat/1
+        ]).
 -export([not_found/1, absent/2]).
 -export([list/0, list_durable/0, list/1, info_keys/0, info/1, info/2, info_all/1, info_all/2,
          emit_info_all/5, list_local/1, info_local/1,
@@ -34,7 +34,7 @@
 -export([notify_sent/2, notify_sent_queue_down/1, resume/2]).
 -export([notify_down_all/2, notify_down_all/3, activate_limit_all/2, credit/5]).
 -export([on_node_up/1, on_node_down/1]).
--export([update/2, store_queue/1, update_decorators/1, policy_changed/2]).
+-export([update/2, store_queue/1, update_decorators/2, policy_changed/2]).
 -export([update_mirroring/1, sync_mirrors/1, cancel_sync_mirrors/1]).
 -export([emit_unresponsive/6, emit_unresponsive_local/5, is_unresponsive/2]).
 -export([has_synchronised_mirrors_online/1, is_match/2, is_in_virtual_host/2]).
@@ -53,8 +53,9 @@
 -export([delete_crashed/1,
          delete_crashed/2,
          delete_crashed_internal/2]).
-
+-export([delete_with/4, delete_with/6]).
 -export([pid_of/1, pid_of/2]).
+-export([pid_or_crashed/2]).
 -export([mark_local_durable_queues_stopped/1]).
 
 -export([rebalance/3]).
@@ -69,7 +70,9 @@
 -export([deactivate_limit_all/2]).
 
 -export([prepend_extra_bcc/1]).
--export([queue/1, queue_name/1, queue_names/1]).
+-export([queue/1, queue_names/1]).
+
+-export([kill_queue/2, kill_queue/3, kill_queue_hard/2, kill_queue_hard/3]).
 
 %% internal
 -export([internal_declare/2, internal_delete/2, run_backing_queue/3,
@@ -95,7 +98,7 @@
 -type qlen() :: rabbit_types:ok(non_neg_integer()).
 -type qfun(A) :: fun ((amqqueue:amqqueue()) -> A | no_return()).
 -type qmsg() :: {name(), pid() | {atom(), pid()}, msg_id(),
-                 boolean(), rabbit_types:message()}.
+                 boolean(), mc:state()}.
 -type msg_id() :: non_neg_integer().
 -type ok_or_errors() ::
         'ok' | {'error', [{'error' | 'exit' | 'throw', any()}]}.
@@ -116,6 +119,7 @@
 -define(CONSUMER_INFO_KEYS,
         [queue_name, channel_pid, consumer_tag, ack_required, prefetch_count,
          active, activity_status, arguments]).
+-define(KILL_QUEUE_DELAY_INTERVAL, 100).
 
 warn_file_limit() ->
     DurableQueues = find_recoverable_queues(),
@@ -259,6 +263,12 @@ internal_declare(Q, Recover) ->
     do_internal_declare(Q, Recover).
 
 do_internal_declare(Q0, true) ->
+    %% TODO Why do we return the old state instead of the actual one?
+    %% I'm leaving it like it was before the khepri refactor, because
+    %% rabbit_amqqueue_process:init_it2 compares the result of this declare to decide
+    %% if continue or stop. If we return the actual one, it fails and the queue stops
+    %% silently during init.
+    %% Maybe we should review this bit of code at some point.
     Q = amqqueue:set_state(Q0, live),
     ok = store_queue(Q),
     {created, Q0};
@@ -285,10 +295,11 @@ store_queue(Q0) ->
     Q = rabbit_queue_decorator:set(Q0),
     rabbit_db_queue:set(Q).
 
--spec update_decorators(name()) -> 'ok'.
+-spec update_decorators(name(), [Decorator]) -> 'ok' when
+      Decorator :: atom().
 
-update_decorators(Name) ->
-    rabbit_db_queue:update_decorators(Name).
+update_decorators(Name, Decorators) ->
+    rabbit_db_queue:update_decorators(Name, Decorators).
 
 -spec policy_changed(amqqueue:amqqueue(), amqqueue:amqqueue()) ->
           'ok'.
@@ -1601,6 +1612,51 @@ delete_immediately_by_resource(Resources) ->
 delete(Q, IfUnused, IfEmpty, ActingUser) ->
     rabbit_queue_type:delete(Q, IfUnused, IfEmpty, ActingUser).
 
+-spec delete_with(amqqueue:amqqueue() | name(), boolean(), boolean(), rabbit_types:username()) ->
+    rabbit_types:ok(integer()) | rabbit_misc:channel_or_connection_exit().
+delete_with(QueueName, IfUnused, IfEmpty, ActingUser) ->
+    delete_with(QueueName, undefined, IfUnused, IfEmpty, ActingUser, false).
+
+-spec delete_with(amqqueue:amqqueue() | name(), pid() | undefined, boolean(), boolean(), rabbit_types:username(), boolean()) ->
+    rabbit_types:ok(integer()) | rabbit_misc:channel_or_connection_exit().
+delete_with(AMQQueue, ConnPid, IfUnused, IfEmpty, Username, CheckExclusive) when ?is_amqqueue(AMQQueue) ->
+    QueueName = amqqueue:get_name(AMQQueue),
+    delete_with(QueueName, ConnPid, IfUnused, IfEmpty, Username, CheckExclusive);
+delete_with(QueueName, ConnPid, IfUnused, IfEmpty, Username, CheckExclusive) when is_record(QueueName, resource) ->
+    case with(
+           QueueName,
+           fun (Q) ->
+                if CheckExclusive ->
+                    check_exclusive_access(Q, ConnPid);
+                true ->
+                    ok
+                end,
+                rabbit_queue_type:delete(Q, IfUnused, IfEmpty, Username)
+           end,
+           fun (not_found) ->
+                   {ok, 0};
+               ({absent, Q, crashed}) ->
+                   _ = delete_crashed(Q, Username),
+                   {ok, 0};
+               ({absent, Q, stopped}) ->
+                   _ = delete_crashed(Q, Username),
+                   {ok, 0};
+               ({absent, Q, Reason}) ->
+                   absent(Q, Reason)
+           end) of
+        {error, in_use} ->
+            rabbit_misc:precondition_failed("~ts in use", [rabbit_misc:rs(QueueName)]);
+        {error, not_empty} ->
+            rabbit_misc:precondition_failed("~ts not empty", [rabbit_misc:rs(QueueName)]);
+        {error, {exit, _, _}} ->
+            %% rabbit_amqqueue:delete()/delegate:invoke might return {error, {exit, _, _}}
+            {ok, 0};
+        {ok, Count} ->
+            {ok, Count};
+        {protocol_error, Type, Reason, ReasonArgs} ->
+            rabbit_misc:protocol_error(Type, Reason, ReasonArgs)
+    end.
+
 %% delete_crashed* INCLUDED FOR BACKWARDS COMPATBILITY REASONS
 delete_crashed(Q) when ?amqqueue_is_classic(Q) ->
     rabbit_classic_queue:delete_crashed(Q).
@@ -1615,33 +1671,6 @@ delete_crashed_internal(Q, ActingUser) when ?amqqueue_is_classic(Q) ->
 -spec purge(amqqueue:amqqueue()) -> qlen().
 purge(Q) when ?is_amqqueue(Q) ->
     rabbit_queue_type:purge(Q).
-
--spec requeue(name(),
-              {rabbit_fifo:consumer_tag(), [msg_id()]},
-              rabbit_queue_type:state()) ->
-    {ok, rabbit_queue_type:state(), rabbit_queue_type:actions()}.
-requeue(QRef, {CTag, MsgIds}, QStates) ->
-    reject(QRef, true, {CTag, MsgIds}, QStates).
-
--spec ack(name(),
-          {rabbit_fifo:consumer_tag(), [msg_id()]},
-          rabbit_queue_type:state()) ->
-    {ok, rabbit_queue_type:state(), rabbit_queue_type:actions()}.
-ack(QPid, {CTag, MsgIds}, QueueStates) ->
-    rabbit_queue_type:settle(QPid, complete, CTag, MsgIds, QueueStates).
-
-
--spec reject(name(),
-             boolean(),
-             {rabbit_fifo:consumer_tag(), [msg_id()]},
-             rabbit_queue_type:state()) ->
-    {ok, rabbit_queue_type:state(), rabbit_queue_type:actions()}.
-reject(QRef, Requeue, {CTag, MsgIds}, QStates) ->
-    Op = case Requeue of
-             true -> requeue;
-             false -> discard
-         end,
-    rabbit_queue_type:settle(QRef, Op, CTag, MsgIds, QStates).
 
 -spec notify_down_all(qpids(), pid()) -> ok_or_errors().
 notify_down_all(QPids, ChPid) ->
@@ -1769,6 +1798,8 @@ internal_delete(Queue, ActingUser, Reason) ->
 
 -spec forget_all_durable(node()) -> 'ok'.
 
+%% TODO this is used by `rabbit_mnesia:remove_node_if_mnesia_running`
+%% Does it make any sense once mnesia is not used/removed?
 forget_all_durable(Node) ->
     UpdateFun = fun(Q) ->
                         forget_node_for_queue(Node, Q)
@@ -1783,6 +1814,9 @@ forget_all_durable(Node) ->
 %% recovery.
 forget_node_for_queue(_DeadNode, Q)
   when ?amqqueue_is_quorum(Q) ->
+    ok;
+forget_node_for_queue(_DeadNode, Q)
+  when ?amqqueue_is_stream(Q) ->
     ok;
 forget_node_for_queue(DeadNode, Q) ->
     RS = amqqueue:get_recoverable_slaves(Q),
@@ -2001,16 +2035,6 @@ pseudo_queue(#resource{kind = queue} = QueueName, Pid, Durable)
                  rabbit_classic_queue % Type
                 ).
 
--spec immutable(amqqueue:amqqueue()) -> amqqueue:amqqueue().
-
-immutable(Q) -> amqqueue:set_immutable(Q).
-
--spec deliver([amqqueue:amqqueue()], rabbit_types:delivery()) -> 'ok'.
-
-deliver(Qs, Delivery) ->
-    _ = rabbit_queue_type:deliver(Qs, Delivery, stateless),
-    ok.
-
 get_quorum_nodes(Q) ->
     case amqqueue:get_type_state(Q) of
         #{nodes := Nodes} ->
@@ -2065,14 +2089,6 @@ queue({Q, RouteInfos})
   when ?is_amqqueue(Q) andalso is_map(RouteInfos) ->
     Q.
 
--spec queue_name(name() | {name(), route_infos()}) ->
-    name().
-queue_name(QName = #resource{kind = queue}) ->
-    QName;
-queue_name({QName = #resource{kind = queue}, RouteInfos})
-  when is_map(RouteInfos) ->
-    QName.
-
 -spec queue_names([Q | {Q, route_infos()}]) ->
     [name()] when Q :: amqqueue:amqqueue().
 queue_names(Queues)
@@ -2102,4 +2118,62 @@ is_queue_args_combination_permitted(Durable, Exclusive) ->
             true;
         true ->
             rabbit_deprecated_features:is_permitted(transient_nonexcl_queues)
+    end.
+
+-spec kill_queue_hard(node(), name()) -> ok.
+kill_queue_hard(Node, QRes = #resource{kind = queue}) ->
+    kill_queue_hard(Node, QRes, boom).
+
+-spec kill_queue_hard(node(), name(), atom()) -> ok.
+kill_queue_hard(Node, QRes = #resource{kind = queue}, Reason) ->
+    case kill_queue(Node, QRes, Reason) of
+        crashed -> ok;
+        stopped -> ok;
+        NewPid when is_pid(NewPid) ->
+            timer:sleep(?KILL_QUEUE_DELAY_INTERVAL),
+            kill_queue_hard(Node, QRes, Reason);
+        Error -> Error
+    end.
+
+-spec kill_queue(node(), name()) -> pid() | crashed | stopped | rabbit_types:error(term()).
+kill_queue(Node, QRes = #resource{kind = queue}) ->
+    kill_queue(Node, QRes, boom).
+
+-spec kill_queue(node(), name(), atom()) -> pid() | crashed | stopped | rabbit_types:error(term()).
+kill_queue(Node, QRes = #resource{kind = queue}, Reason = shutdown) ->
+    Pid1 = pid_or_crashed(Node, QRes),
+    exit(Pid1, Reason),
+    rabbit_amqqueue_control:await_state(Node, QRes, stopped),
+    stopped;
+kill_queue(Node, QRes = #resource{kind = queue}, Reason) ->
+    case pid_or_crashed(Node, QRes) of
+        Pid1 when is_pid(Pid1) ->
+            exit(Pid1, Reason),
+            rabbit_amqqueue_control:await_new_pid(Node, QRes, Pid1);
+        crashed ->
+            crashed;
+        Error ->
+            Error
+    end.
+
+-spec pid_or_crashed(node(), name()) -> pid() | crashed | rabbit_types:error(term()).
+pid_or_crashed(Node, QRes = #resource{virtual_host = VHost, kind = queue}) ->
+    case rpc:call(Node, rabbit_amqqueue, lookup, [QRes]) of
+        {ok, Q} ->
+            QPid = amqqueue:get_pid(Q),
+            State = amqqueue:get_state(Q),
+            case State of
+                crashed ->
+                    case rabbit_amqqueue_sup_sup:find_for_vhost(VHost, Node) of
+                        {error, {queue_supervisor_not_found, _}} -> {error, no_sup};
+                        {ok, SPid} ->
+                            case rabbit_misc:remote_sup_child(Node, SPid) of
+                            {ok, _}           -> QPid;   %% restarting
+                            {error, no_child} -> crashed %% given up
+                            end
+                    end;
+                _       -> QPid
+            end;
+        Error = {error, _} -> Error;
+        Reason             -> {error, Reason}
     end.

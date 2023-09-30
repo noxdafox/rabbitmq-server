@@ -38,7 +38,7 @@
          consume/3,
          cancel/5,
          handle_event/3,
-         deliver/2,
+         deliver/3,
          settle/5,
          credit/5,
          dequeue/5,
@@ -51,7 +51,8 @@
 
 -export([delete_crashed/1,
          delete_crashed/2,
-         delete_crashed_internal/2]).
+         delete_crashed_internal/2,
+         delete_crashed_in_backing_queue/1]).
 
 -export([confirm_to_sender/3,
          send_rejection/3,
@@ -169,7 +170,19 @@ find_missing_queues([Q1|Rem1], [Q2|Rem2] = Q2s, Acc) ->
 -spec policy_changed(amqqueue:amqqueue()) -> ok.
 policy_changed(Q) ->
     QPid = amqqueue:get_pid(Q),
-    gen_server2:cast(QPid, policy_changed).
+    case rabbit_khepri:is_enabled() of
+        false ->
+            gen_server2:cast(QPid, policy_changed);
+        true ->
+            %% When using Khepri, projections are guaranteed to be atomic on
+            %% the node that processes them, but there might be a slight delay
+            %% until they're applied on other nodes. Some test suites fail
+            %% intermittently, showing that rabbit_amqqueue_process is reading
+            %% the old policy value. We use the khepri ff to hide this API change,
+            %% and use the up-to-date record to update the policy on the gen_server
+            %% state.
+            gen_server2:cast(QPid, {policy_changed, Q})
+    end.
 
 stat(Q) ->
     delegate:invoke(amqqueue:get_pid(Q),
@@ -326,18 +339,21 @@ settlement_action(Type, QRef, MsgSeqs, Acc) ->
     [{Type, QRef, MsgSeqs} | Acc].
 
 -spec deliver([{amqqueue:amqqueue(), state()}],
-              Delivery :: term()) ->
+              Delivery :: mc:state(),
+              rabbit_queue_type:delivery_options()) ->
     {[{amqqueue:amqqueue(), state()}], rabbit_queue_type:actions()}.
-deliver(Qs0, #delivery{flow = Flow,
-                       msg_seq_no = MsgNo,
-                       message = #basic_message{} = Msg0,
-                       confirm = Confirm} = Delivery0) ->
+deliver(Qs0, Msg0, Options) ->
     %% add guid to content here instead of in rabbit_basic:message/3,
     %% as classic queues are the only ones that need it
-    Msg = Msg0#basic_message{id = rabbit_guid:gen()},
-    Delivery = Delivery0#delivery{message = Msg},
+    Msg = mc:prepare(store, mc:set_annotation(id, rabbit_guid:gen(), Msg0)),
+    Mandatory = maps:get(mandatory, Options, false),
+    MsgSeqNo = maps:get(correlation, Options, undefined),
+    Flow = maps:get(flow, Options, noflow),
+    Confirm = MsgSeqNo /= undefined,
 
-    {MPids, SPids, Qs} = qpids(Qs0, Confirm, MsgNo),
+    {MPids, SPids, Qs} = qpids(Qs0, Confirm, MsgSeqNo),
+    Delivery = rabbit_basic:delivery(Mandatory, Confirm, Msg, MsgSeqNo, Flow),
+
     case Flow of
         %% Here we are tracking messages sent by the rabbit_channel
         %% process. We are accessing the rabbit_channel process
@@ -462,13 +478,29 @@ delete_crashed(Q) ->
     delete_crashed(Q, ?INTERNAL_USER).
 
 delete_crashed(Q, ActingUser) ->
-    ok = rpc:call(amqqueue:qnode(Q), ?MODULE, delete_crashed_internal,
-                  [Q, ActingUser]).
+    %% Delete from `rabbit_db_queue' from the queue's node. The deletion's
+    %% change to the Khepri projection is immediately consistent on that node,
+    %% so the call will block until that node has fully deleted and forgotten
+    %% about the queue.
+    Ret = rpc:call(amqqueue:qnode(Q), ?MODULE, delete_crashed_in_backing_queue,
+                   [Q]),
+    case Ret of
+        {badrpc, {'EXIT', {undef, _}}} ->
+            %% Compatibility: if the remote node doesn't yet expose this
+            %% function, call it directly on this node.
+            ok = delete_crashed_in_backing_queue(Q);
+        ok ->
+            ok
+    end,
+    ok = rabbit_amqqueue:internal_delete(Q, ActingUser).
 
 delete_crashed_internal(Q, ActingUser) ->
-    {ok, BQ} = application:get_env(rabbit, backing_queue_module),
-    BQ:delete_crashed(Q),
+    delete_crashed_in_backing_queue(Q),
     ok = rabbit_amqqueue:internal_delete(Q, ActingUser).
+
+delete_crashed_in_backing_queue(Q) ->
+    {ok, BQ} = application:get_env(rabbit, backing_queue_module),
+    BQ:delete_crashed(Q).
 
 recover_durable_queues(QueuesAndRecoveryTerms) ->
     {Results, Failures} =
@@ -484,7 +516,7 @@ capabilities() ->
                                <<"max-age">>, <<"stream-max-segment-size-bytes">>,
                                <<"queue-leader-locator">>, <<"initial-cluster-size">>,
                                %% Quorum policies
-                               <<"delivery-limit">>, <<"dead-letter-strategy">>],
+                               <<"delivery-limit">>, <<"dead-letter-strategy">>, <<"max-in-memory-length">>, <<"max-in-memory-bytes">>, <<"target-group-size">>],
       queue_arguments => [<<"x-expires">>, <<"x-message-ttl">>, <<"x-dead-letter-exchange">>,
                           <<"x-dead-letter-routing-key">>, <<"x-max-length">>,
                           <<"x-max-length-bytes">>, <<"x-max-priority">>,

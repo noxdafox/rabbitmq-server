@@ -8,7 +8,6 @@
 -module(rabbit_priority_queue).
 
 -include_lib("rabbit_common/include/rabbit.hrl").
--include_lib("rabbit_common/include/rabbit_framing.hrl").
 -include("amqqueue.hrl").
 
 -behaviour(rabbit_backing_queue).
@@ -618,11 +617,8 @@ priority(Priority, MaxP) when is_integer(Priority), Priority =< MaxP ->
     Priority;
 priority(Priority, MaxP) when is_integer(Priority), Priority > MaxP ->
     MaxP;
-priority(#basic_message{content = Content}, MaxP) ->
-    priority(rabbit_binary_parser:ensure_content_decoded(Content), MaxP);
-priority(#content{properties = Props}, MaxP) ->
-    #'P_basic'{priority = Priority0} = Props,
-    priority(Priority0, MaxP).
+priority(Msg, MaxP) ->
+    priority(mc:priority(Msg), MaxP).
 
 add_maybe_infinity(infinity, _) -> infinity;
 add_maybe_infinity(_, infinity) -> infinity;
@@ -646,7 +642,13 @@ priority_on_acktags(P, AckTags) ->
 combine_status(P, New, nothing) ->
     [{priority_lengths, [{P, proplists:get_value(len, New)}]} | New];
 combine_status(P, New, Old) ->
-    Combined = [{K, cse(V, proplists:get_value(K, Old))} || {K, V} <- New],
+    Combined = [case K of
+                    version ->
+                        {K, proplists:get_value(version, Old)};
+                    _ ->
+                        {K, cse(V, proplists:get_value(K, Old))}
+                end
+                || {K, V} <- New],
     Lens = [{P, proplists:get_value(len, New)} |
             proplists:get_value(priority_lengths, Old)],
     [{priority_lengths, Lens} | Combined].
@@ -679,6 +681,7 @@ find_head_message_timestamp(_, [], Timestamp) ->
 
 zip_msgs_and_acks(Pubs, AckTags) ->
     lists:zipwith(
-      fun ({#basic_message{ id = Id }, _Props}, AckTag) ->
-                  {Id, AckTag}
+      fun ({Msg, _Props}, AckTag) ->
+              Id = mc:get_annotation(id, Msg),
+              {Id, AckTag}
       end, Pubs, AckTags).

@@ -99,12 +99,11 @@
 
 -rabbit_feature_flag(
    {restart_streams,
-    #{desc          => "Support for restarting streams with optional preferred next leader argument. "
+    #{desc          => "Support for restarting streams with optional preferred next leader argument."
       "Used to implement stream leader rebalancing",
       stability     => stable,
       depends_on    => [stream_queue]
      }}).
-
 
 -rabbit_feature_flag(
    {stream_sac_coordinator_unblock_group,
@@ -119,4 +118,33 @@
     #{desc          => "Support for stream filtering.",
       stability     => stable,
       depends_on    => [stream_queue]
+     }}).
+
+-rabbit_feature_flag(
+   {message_containers,
+    #{desc          => "Message containers.",
+      stability     => stable,
+      depends_on    => [feature_flags_v2]
+     }}).
+
+-rabbit_feature_flag(
+   {khepri_db,
+    #{desc          => "Use the new Khepri Raft-based metadata store",
+      doc_url       => "", %% TODO
+      stability     => experimental,
+      depends_on    => [feature_flags_v2,
+                        direct_exchange_routing_v2,
+                        maintenance_mode_status,
+                        user_limits,
+                        virtual_host_metadata,
+                        tracking_records_in_ets,
+                        listener_records_in_ets,
+
+                        %% Deprecated features.
+                        classic_queue_mirroring,
+                        ram_node_type],
+      callbacks     => #{enable =>
+                         {rabbit_khepri, khepri_db_migration_enable},
+                         post_enable =>
+                         {rabbit_khepri, khepri_db_migration_post_enable}}
      }}).

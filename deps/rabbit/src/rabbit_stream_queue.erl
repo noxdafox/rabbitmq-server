@@ -20,7 +20,7 @@
          consume/3,
          cancel/5,
          handle_event/3,
-         deliver/2,
+         deliver/3,
          settle/5,
          credit/5,
          dequeue/5,
@@ -42,7 +42,8 @@
 -export([set_retention_policy/3]).
 -export([restart_stream/3,
          add_replica/3,
-         delete_replica/3]).
+         delete_replica/3,
+         delete_all_replicas/1]).
 -export([format_osiris_event/2]).
 -export([update_stream_conf/2]).
 -export([readers/1]).
@@ -237,10 +238,11 @@ consume(Q, #{limiter_active := true}, _State)
   when ?amqqueue_is_stream(Q) ->
     {error, global_qos_not_supported_for_queue_type};
 consume(Q, Spec,
-        #stream_client{filtering_supported = FilteringSupported} = QState0) when ?amqqueue_is_stream(Q) ->
+        #stream_client{filtering_supported = FilteringSupported} = QState0)
+  when ?amqqueue_is_stream(Q) ->
     %% Messages should include the offset as a custom header.
-    case check_queue_exists_in_local_node(Q) of
-        ok ->
+    case get_local_pid(QState0) of
+        {LocalPid, QState} when is_pid(LocalPid) ->
             #{no_ack := NoAck,
               channel_pid := ChPid,
               prefetch_count := ConsumerPrefetchCount,
@@ -249,30 +251,34 @@ consume(Q, Spec,
               args := Args,
               ok_msg := OkMsg} = Spec,
             QName = amqqueue:get_name(Q),
-            case parse_offset_arg(rabbit_misc:table_lookup(Args, <<"x-stream-offset">>)) of
+            case parse_offset_arg(
+                   rabbit_misc:table_lookup(Args, <<"x-stream-offset">>)) of
                 {error, _} = Err ->
                     Err;
                 {ok, OffsetSpec} ->
-                    _ = rabbit_stream_coordinator:register_local_member_listener(Q),
-                    rabbit_core_metrics:consumer_created(ChPid, ConsumerTag, ExclusiveConsume,
-                                                         not NoAck, QName,
-                                                         ConsumerPrefetchCount, false,
-                                                         up, Args),
-                    %% FIXME: reply needs to be sent before the stream begins sending
-                    %% really it should be sent by the stream queue process like classic queues
-                    %% do
-                    maybe_send_reply(ChPid, OkMsg),
                     FilterSpec = filter_spec(Args),
                     case {FilterSpec, FilteringSupported} of
                         {#{filter_spec := _}, false} ->
-                            {protocol_error, precondition_failed, "Filtering is not supported", []};
+                            {protocol_error, precondition_failed,
+                             "Filtering is not supported", []};
                         _ ->
-                            begin_stream(QState0, ConsumerTag, OffsetSpec,
+                            rabbit_core_metrics:consumer_created(ChPid, ConsumerTag,
+                                                                 ExclusiveConsume,
+                                                                 not NoAck, QName,
+                                                                 ConsumerPrefetchCount,
+                                                                 false, up, Args),
+                            %% reply needs to be sent before the stream
+                            %% begins sending
+                            maybe_send_reply(ChPid, OkMsg),
+                            _ = rabbit_stream_coordinator:register_local_member_listener(Q),
+                            begin_stream(QState, ConsumerTag, OffsetSpec,
                                          ConsumerPrefetchCount, FilterSpec)
                     end
             end;
-        Err ->
-            Err
+        {undefined, _} ->
+            {protocol_error, precondition_failed,
+             "queue '~ts' does not have a running replica on the local node",
+             [rabbit_misc:rs(amqqueue:get_name(Q))]}
     end.
 
 -spec parse_offset_arg(undefined |
@@ -338,8 +344,7 @@ get_local_pid(#stream_client{local_pid = Pid} = State)
 get_local_pid(#stream_client{leader = Pid} = State)
   when is_pid(Pid) andalso node(Pid) == node() ->
     {Pid, State#stream_client{local_pid = Pid}};
-get_local_pid(#stream_client{stream_id = StreamId,
-                             local_pid = undefined} = State) ->
+get_local_pid(#stream_client{stream_id = StreamId} = State) ->
     %% query local coordinator to get pid
     case rabbit_stream_coordinator:local_pid(StreamId) of
         {ok, Pid} ->
@@ -348,34 +353,30 @@ get_local_pid(#stream_client{stream_id = StreamId,
             {undefined, State}
     end.
 
-begin_stream(#stream_client{name = QName, readers = Readers0} = State0,
-             Tag, Offset, Max, Options) ->
-    {LocalPid, State} = get_local_pid(State0),
-    case LocalPid of
-        undefined ->
-            {error, no_local_stream_replica_available};
-        _ ->
-            CounterSpec = {{?MODULE, QName, Tag, self()}, []},
-            {ok, Seg0} = osiris:init_reader(LocalPid, Offset, CounterSpec, Options),
-            NextOffset = osiris_log:next_offset(Seg0) - 1,
-            osiris:register_offset_listener(LocalPid, NextOffset),
-            %% TODO: avoid double calls to the same process
-            StartOffset = case Offset of
-                              first -> NextOffset;
-                              last -> NextOffset;
-                              next -> NextOffset;
-                              {timestamp, _} -> NextOffset;
-                              _ -> Offset
-                          end,
-            Str0 = #stream{credit = Max,
-                           start_offset = StartOffset,
-                           listening_offset = NextOffset,
-                           log = Seg0,
-                           max = Max,
-                           reader_options = Options},
-            {ok, State#stream_client{local_pid = LocalPid,
-                                     readers = Readers0#{Tag => Str0}}}
-    end.
+begin_stream(#stream_client{name = QName,
+                            readers = Readers0,
+                            local_pid = LocalPid} = State,
+             Tag, Offset, Max, Options)
+  when is_pid(LocalPid) ->
+    CounterSpec = {{?MODULE, QName, Tag, self()}, []},
+    {ok, Seg0} = osiris:init_reader(LocalPid, Offset, CounterSpec, Options),
+    NextOffset = osiris_log:next_offset(Seg0) - 1,
+    osiris:register_offset_listener(LocalPid, NextOffset),
+    StartOffset = case Offset of
+                      first -> NextOffset;
+                      last -> NextOffset;
+                      next -> NextOffset;
+                      {timestamp, _} -> NextOffset;
+                      _ -> Offset
+                  end,
+    Str0 = #stream{credit = Max,
+                   start_offset = StartOffset,
+                   listening_offset = NextOffset,
+                   log = Seg0,
+                   max = Max,
+                   reader_options = Options},
+    {ok, State#stream_client{local_pid = LocalPid,
+                             readers = Readers0#{Tag => Str0}}}.
 
 cancel(_Q, ConsumerTag, OkMsg, ActingUser, #stream_client{readers = Readers0,
                                                           name = QName} = State) ->
@@ -395,8 +396,8 @@ cancel(_Q, ConsumerTag, OkMsg, ActingUser, #stream_client{readers = Readers0,
     end.
 
 credit(QName, CTag, Credit, Drain, #stream_client{readers = Readers0,
-                                           name = Name,
-                                           local_pid = LocalPid} = State) ->
+                                                  name = Name,
+                                                  local_pid = LocalPid} = State) ->
     {Readers1, Msgs} = case Readers0 of
                           #{CTag := #stream{credit = Credit0} = Str0} ->
                               Str1 = Str0#stream{credit = Credit0 + Credit},
@@ -410,37 +411,41 @@ credit(QName, CTag, Credit, Drain, #stream_client{readers = Readers0,
             true ->
                 case Readers1 of
                     #{CTag := #stream{credit = Credit1} = Str2} ->
-                        {Readers0#{CTag => Str2#stream{credit = 0}}, [{send_drained, {CTag, Credit1}}]};
+                        {Readers0#{CTag => Str2#stream{credit = 0}},
+                         [{send_drained, {CTag, Credit1}}]};
                     _ ->
                         {Readers1, []}
                 end;
             false ->
                 {Readers1, []}
         end,
-    {State#stream_client{readers = Readers}, [{send_credit_reply, length(Msgs)},
-                                              {deliver, CTag, true, Msgs}] ++ Actions}.
+    {State#stream_client{readers = Readers},
+     [{send_credit_reply, length(Msgs)},
+      {deliver, CTag, true, Msgs}] ++ Actions}.
 
-deliver(QSs, #delivery{message = Msg, confirm = Confirm} = Delivery) ->
+deliver(QSs, Msg, Options) ->
     lists:foldl(
       fun({Q, stateless}, {Qs, Actions}) ->
               LeaderPid = amqqueue:get_pid(Q),
               ok = osiris:write(LeaderPid,
                                 stream_message(Msg, filtering_supported())),
               {Qs, Actions};
-         ({Q, S0}, {Qs, Actions}) ->
-              {S, As} = deliver(Confirm, Delivery, S0),
-              {[{Q, S} | Qs], As ++ Actions}
+         ({Q, S0}, {Qs, Actions0}) ->
+              {S, Actions} = deliver0(maps:get(correlation, Options, undefined),
+                                      Msg, S0, Actions0),
+              {[{Q, S} | Qs], Actions}
       end, {[], []}, QSs).
 
-deliver(_Confirm, #delivery{message = Msg, msg_seq_no = MsgId},
-        #stream_client{name = Name,
-                       leader = LeaderPid,
-                       writer_id = WriterId,
-                       next_seq = Seq,
-                       correlation = Correlation0,
-                       soft_limit = SftLmt,
-                       slow = Slow0,
-                       filtering_supported = FilteringSupported} = State) ->
+deliver0(MsgId, Msg,
+         #stream_client{name = Name,
+                        leader = LeaderPid,
+                        writer_id = WriterId,
+                        next_seq = Seq,
+                        correlation = Correlation0,
+                        soft_limit = SftLmt,
+                        slow = Slow0,
+                        filtering_supported = FilteringSupported} = State,
+         Actions0) ->
     ok = osiris:write(LeaderPid, WriterId, Seq,
                       stream_message(Msg, FilteringSupported)),
     Correlation = case MsgId of
@@ -451,9 +456,9 @@ deliver(_Confirm, #delivery{message = Msg, msg_seq_no = MsgId},
                   end,
     {Slow, Actions} = case maps:size(Correlation) >= SftLmt of
                           true when not Slow0 ->
-                              {true, [{block, Name}]};
+                              {true, [{block, Name} | Actions0]};
                           Bool ->
-                              {Bool, []}
+                              {Bool, Actions0}
                       end,
     {State#stream_client{next_seq = Seq + 1,
                          correlation = Correlation,
@@ -461,22 +466,14 @@ deliver(_Confirm, #delivery{message = Msg, msg_seq_no = MsgId},
 
 stream_message(Msg, _FilteringSupported = true) ->
     MsgData = msg_to_iodata(Msg),
-    case filter_header(Msg) of
-        {_, longstr, Value} ->
-            {Value, MsgData};
-        _ ->
-            MsgData
+    case mc:x_header(<<"x-stream-filter-value">>, Msg) of
+        undefined ->
+            MsgData;
+        {utf8, Value} ->
+            {Value, MsgData}
     end;
 stream_message(Msg, _FilteringSupported = false) ->
     msg_to_iodata(Msg).
-
-filter_header(Msg) ->
-    basic_header(<<"x-stream-filter-value">>, Msg).
-
-basic_header(Key, #basic_message{content = Content}) ->
-    Headers = rabbit_basic:extract_headers(Content),
-    rabbit_basic:header(Key, Headers).
-
 
 -spec dequeue(_, _, _, _, client()) -> no_return().
 dequeue(_, _, _, _, #stream_client{name = Name}) ->
@@ -559,8 +556,8 @@ recover(_VHost, Queues) ->
       end, {[], []}, Queues).
 
 settle(QName, complete, CTag, MsgIds, #stream_client{readers = Readers0,
-                                              local_pid = LocalPid,
-                                              name = Name} = State) ->
+                                                     local_pid = LocalPid,
+                                                     name = Name} = State) ->
     Credit = length(MsgIds),
     {Readers, Msgs} = case Readers0 of
                           #{CTag := #stream{credit = Credit0} = Str0} ->
@@ -857,8 +854,7 @@ close(#stream_client{readers = Readers}) ->
 
 update(Q, State)
   when ?is_amqqueue(Q) ->
-    Pid = amqqueue:get_pid(Q),
-    update_leader_pid(Pid, State).
+    State.
 
 update_leader_pid(Pid, #stream_client{leader = Pid} =  State) ->
     State;
@@ -930,17 +926,31 @@ delete_replica(VHost, Name, Node) ->
         {ok, Q} when ?amqqueue_is_quorum(Q) ->
             {error, quorum_queue_not_supported};
         {ok, Q} when ?amqqueue_is_stream(Q) ->
-            case lists:member(Node, rabbit_nodes:list_running()) of
-                false ->
-                    {error, node_not_running};
-                true ->
-                    #{name := StreamId} = amqqueue:get_type_state(Q),
-                    {ok, Reply, _} = rabbit_stream_coordinator:delete_replica(StreamId, Node),
-                    Reply
-            end;
+            #{name := StreamId} = amqqueue:get_type_state(Q),
+            {ok, Reply, _} = rabbit_stream_coordinator:delete_replica(StreamId, Node),
+            Reply;
         E ->
             E
     end.
+
+delete_all_replicas(Node) ->
+    rabbit_log:info("Asked to remove all stream replicas from node ~ts", [Node]),
+    Streams = rabbit_amqqueue:list_by_type(stream),
+    lists:map(fun(Q) ->
+                      QName = amqqueue:get_name(Q),
+                      rabbit_log:info("~ts: removing replica on node ~w",
+                                      [rabbit_misc:rs(QName), Node]),
+                      #{name := StreamId} = amqqueue:get_type_state(Q),
+                      {ok, Reply, _} = rabbit_stream_coordinator:delete_replica(StreamId, Node),
+                      case Reply of
+                          ok ->
+                              {QName, ok};
+                          Err ->
+                              rabbit_log:warning("~ts: failed to remove replica on node ~w, error: ~w",
+                                                 [rabbit_misc:rs(QName), Node, Err]),
+                              {QName, {error, Err}}
+                      end
+              end, Streams).
 
 make_stream_conf(Q) ->
     QName = amqqueue:get_name(Q),
@@ -999,17 +1009,6 @@ stream_name(#resource{virtual_host = VHost, name = Name}) ->
 recover(Q) ->
     {ok, Q}.
 
-check_queue_exists_in_local_node(Q) ->
-    #{name := StreamId} = amqqueue:get_type_state(Q),
-    case rabbit_stream_coordinator:local_pid(StreamId) of
-        {ok, Pid} when is_pid(Pid) ->
-            ok;
-        _ ->
-            {protocol_error, precondition_failed,
-             "queue '~ts' does not have a replica on the local node",
-             [rabbit_misc:rs(amqqueue:get_name(Q))]}
-    end.
-
 maybe_send_reply(_ChPid, undefined) -> ok;
 maybe_send_reply(ChPid, Msg) -> ok = rabbit_channel:send_command(ChPid, Msg).
 
@@ -1039,8 +1038,7 @@ stream_entries(QName, Name, LocalPid,
         {Records, Seg} ->
             Msgs = [begin
                         Msg0 = binary_to_msg(QName, B),
-                        Msg = rabbit_basic:add_header(<<"x-stream-offset">>,
-                                                      long, O, Msg0),
+                        Msg = mc:set_annotation(<<"x-stream-offset">>, O, Msg0),
                         {Name, LocalPid, O, false, Msg}
                     end || {O, B} <- Records,
                            O >= StartOffs],
@@ -1062,41 +1060,24 @@ stream_entries(QName, Name, LocalPid,
 stream_entries(_QName, _Name, _LocalPid, Str, Msgs) ->
     {Str, Msgs}.
 
-binary_to_msg(#resource{virtual_host = VHost,
-                        kind = queue,
+binary_to_msg(#resource{kind = queue,
                         name = QName}, Data) ->
-    R0 = rabbit_msg_record:init(Data),
-    %% if the message annotation isn't present the data most likely came from
-    %% the rabbitmq-stream plugin so we'll choose defaults that simulate use
-    %% of the direct exchange
-    {utf8, Exchange} = rabbit_msg_record:message_annotation(<<"x-exchange">>,
-                                                            R0, {utf8, <<>>}),
-    {utf8, RoutingKey} = rabbit_msg_record:message_annotation(<<"x-routing-key">>,
-                                                              R0, {utf8, QName}),
-    {Props, Payload} = rabbit_msg_record:to_amqp091(R0),
-    XName = #resource{kind = exchange,
-                      virtual_host = VHost,
-                      name = Exchange},
-    Content = #content{class_id = 60,
-                       properties = Props,
-                       properties_bin = none,
-                       payload_fragments_rev = [Payload]},
-    {ok, Msg} = rabbit_basic:message(XName, RoutingKey, Content),
-    Msg.
+    Mc0 = mc:init(mc_amqp, amqp10_framing:decode_bin(Data), #{}),
+    %% If exchange or routing_keys annotation isn't present the data most likely came
+    %% from the rabbitmq-stream plugin so we'll choose defaults that simulate use
+    %% of the direct exchange.
+    Mc = case mc:get_annotation(exchange, Mc0) of
+             undefined -> mc:set_annotation(exchange, <<>>, Mc0);
+             _ -> Mc0
+         end,
+    case mc:get_annotation(routing_keys, Mc) of
+        undefined -> mc:set_annotation(routing_keys, [QName], Mc);
+        _ -> Mc
+    end.
 
-
-msg_to_iodata(#basic_message{exchange_name = #resource{name = Exchange},
-                             routing_keys = [RKey | _],
-                             content = Content}) ->
-    #content{properties = Props,
-             payload_fragments_rev = Payload} =
-        rabbit_binary_parser:ensure_content_decoded(Content),
-    R0 = rabbit_msg_record:from_amqp091(Props, lists:reverse(Payload)),
-    %% TODO durable?
-    R = rabbit_msg_record:add_message_annotations(
-          #{<<"x-exchange">> => {utf8, Exchange},
-            <<"x-routing-key">> => {utf8, RKey}}, R0),
-    rabbit_msg_record:to_iodata(R).
+msg_to_iodata(Msg0) ->
+    Sections = mc:protocol_state(mc:convert(mc_amqp, Msg0)),
+    mc_amqp:serialize(Sections).
 
 capabilities() ->
     #{unsupported_policies => [%% Classic policies
@@ -1109,7 +1090,7 @@ capabilities() ->
                                <<"ha-promote-on-shutdown">>, <<"ha-promote-on-failure">>,
                                <<"queue-master-locator">>,
                                %% Quorum policies
-                               <<"dead-letter-strategy">>],
+                               <<"dead-letter-strategy">>, <<"target-group-size">>],
       queue_arguments => [<<"x-max-length-bytes">>, <<"x-queue-type">>,
                           <<"x-max-age">>, <<"x-stream-max-segment-size-bytes">>,
                           <<"x-initial-cluster-size">>, <<"x-queue-leader-locator">>],
@@ -1138,6 +1119,7 @@ resend_all(#stream_client{leader = LeaderPid,
     State.
 
 set_leader_pid(Pid, QName) ->
+    %% TODO this should probably be a single khepri transaction for better performance.
     Fun = fun (Q) ->
                   amqqueue:set_pid(Q, Pid)
           end,

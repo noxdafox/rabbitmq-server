@@ -129,7 +129,7 @@
         }).
 
 -record(file_summary,
-        {file, valid_total_size, file_size, locked}).
+        {file, valid_total_size, unused1, unused2, file_size, locked, unused3}).
 
 -record(gc_state,
         { dir,
@@ -553,9 +553,11 @@ read_many_file2(MsgIds0, CState = #client_msstate{ dir              = Dir,
             %% Before we continue the read_many calls we must remove the
             %% MsgIds we have read from the list and add the messages to
             %% the Acc.
-            {Acc, MsgIdsRead} = lists:foldl(fun(Msg = #basic_message{id = MsgIdRead}, {Acc1, MsgIdsAcc}) ->
-                {Acc1#{MsgIdRead => Msg}, [MsgIdRead|MsgIdsAcc]}
-            end, {Acc0, []}, Msgs),
+            {Acc, MsgIdsRead} = lists:foldl(
+                                  fun(Msg, {Acc1, MsgIdsAcc}) ->
+                                          MsgIdRead = mc:get_annotation(id, Msg),
+                                          {Acc1#{MsgIdRead => Msg}, [MsgIdRead|MsgIdsAcc]}
+                                  end, {Acc0, []}, Msgs),
             MsgIds = MsgIds0 -- MsgIdsRead,
             %% Unmark opened files and continue.
             read_many_file3(MsgIds, CState#client_msstate{ reader = Reader }, Acc, File)
@@ -1233,10 +1235,21 @@ contains_message(MsgId, From, State) ->
 
 update_msg_cache(CacheEts, MsgId, Msg) ->
     case ets:insert_new(CacheEts, {MsgId, Msg, 1}) of
-        true  -> ok;
-        false -> rabbit_misc:safe_ets_update_counter(
-                   CacheEts, MsgId, {3, +1}, fun (_) -> ok end,
-                   fun () -> update_msg_cache(CacheEts, MsgId, Msg) end)
+        true  ->
+            ok;
+        false ->
+            %% Note: This is basically rabbit_misc:safe_ets_update_counter/5,
+            %% but without the debug log that we don't want as the update is
+            %% more likely to fail following recent reworkings.
+            try
+                ets:update_counter(CacheEts, MsgId, {3, +1}),
+                ok
+            catch error:badarg ->
+                %% The entry must have been removed between
+                %% insert_new and update_counter, most likely
+                %% due to a file rollover or a confirm. Try again.
+                update_msg_cache(CacheEts, MsgId, Msg)
+            end
     end.
 
 adjust_valid_total_size(File, Delta, State = #msstate {

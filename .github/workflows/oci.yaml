@@ -36,16 +36,18 @@ jobs:
           - image_tag_suffix: otp-min-bazel
             otp_version_id: 25_3
           - image_tag_suffix: otp-max-bazel
-            otp_version_id: 26
+            otp_version_id: 26_1
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Mount Bazel Cache
-        uses: actions/cache@v3.3.1
+        uses: actions/cache@v3.3.2
         with:
           path: "/home/runner/repo-cache/"
-          key: repo-cache
+          key: ${{ runner.os }}-repo-cache-${{ hashFiles('MODULE.bazel','WORKSPACE','bazel/bzlmod/secondary_umbrella.bzl') }}
+          restore-keys: |
+            ${{ runner.os }}-repo-cache-
 
       - name: Configure Bazel
         run: |
@@ -98,7 +100,7 @@ jobs:
 
       - name: Login to DockerHub
         if: steps.authorized.outputs.PUSH == 'true'
-        uses: docker/login-action@v1
+        uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PASSWORD }}

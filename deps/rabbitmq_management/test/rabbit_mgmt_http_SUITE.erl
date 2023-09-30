@@ -22,7 +22,7 @@
                                 http_put/4, http_put/6,
                                 http_post/4, http_post/6,
                                 http_upload_raw/8,
-                                http_delete/3, http_delete/5,
+                                http_delete/3, http_delete/4, http_delete/5,
                                 http_put_raw/4, http_post_accept_json/4,
                                 req/4, auth_header/2,
                                 assert_permanent_redirect/3,
@@ -151,7 +151,8 @@ all_tests() -> [
     auth_attempts_test,
     user_limits_list_test,
     user_limit_set_test,
-    config_environment_test
+    config_environment_test,
+    disabled_qq_replica_opers_test
 ].
 
 %% -------------------------------------------------------------------
@@ -216,6 +217,11 @@ init_per_testcase(Testcase = disabled_operator_policy_test, Config) ->
     rabbit_ct_broker_helpers:rpc_all(Config,
       application, set_env, [rabbitmq_management, restrictions, Restrictions]),
     rabbit_ct_helpers:testcase_started(Config, Testcase);
+init_per_testcase(Testcase = disabled_qq_replica_opers_test, Config) ->
+    Restrictions = [{quorum_queue_replica_operations, [{disabled, true}]}],
+    rabbit_ct_broker_helpers:rpc_all(Config,
+      application, set_env, [rabbitmq_management, restrictions, Restrictions]),
+    rabbit_ct_helpers:testcase_started(Config, Testcase);
 init_per_testcase(Testcase, Config) ->
     rabbit_ct_broker_helpers:close_all_connections(Config, 0, <<"rabbit_mgmt_SUITE:init_per_testcase">>),
     rabbit_ct_helpers:testcase_started(Config, Testcase).
@@ -274,6 +280,10 @@ end_per_testcase0(config_environment_test, Config) ->
                                  [rabbit, config_environment_test_env]),
     Config;
 end_per_testcase0(disabled_operator_policy_test, Config) ->
+    rabbit_ct_broker_helpers:rpc(Config, 0, application, unset_env,
+                                 [rabbitmq_management, restrictions]),
+    Config;
+end_per_testcase0(disabled_qq_replica_opers_test, Config) ->
     rabbit_ct_broker_helpers:rpc(Config, 0, application, unset_env,
                                  [rabbitmq_management, restrictions]),
     Config;
@@ -349,7 +359,7 @@ ets_tables_memory_test(Config) ->
     Path = "/nodes/" ++ binary_to_list(maps:get(name, Node)) ++ "/memory/ets",
     Result = http_get(Config, Path, ?OK),
     assert_keys([ets_tables_memory], Result),
-    NonMgmtKeys = [rabbit_vhost,rabbit_user_permission],
+    NonMgmtKeys = [tracked_connection, tracked_channel],
     Keys = [queue_stats, vhost_stats_coarse_conn_stats,
         connection_created_stats, channel_process_stats, consumer_stats,
         queue_msg_rates],
@@ -1983,9 +1993,7 @@ queue_purge_test(Config) ->
     http_delete(Config, "/queues/%2F/myqueue/contents", {group, '2xx'}),
     http_delete(Config, "/queues/%2F/badqueue/contents", ?NOT_FOUND),
     http_delete(Config, "/queues/%2F/exclusive/contents", ?BAD_REQUEST),
-    http_delete(Config, "/queues/%2F/exclusive", ?BAD_REQUEST),
-    #'basic.get_empty'{} =
-        amqp_channel:call(Ch, #'basic.get'{queue = <<"myqueue">>}),
+    http_delete(Config, "/queues/%2F/exclusive", {group, '2xx'}),
     close_channel(Ch),
     close_connection(Conn),
     http_delete(Config, "/queues/%2F/myqueue", {group, '2xx'}),
@@ -2933,7 +2941,7 @@ policy_permissions_test(Config) ->
     http_put(Config, "/permissions/v/mgmt",   Perms, {group, '2xx'}),
 
     Policy = [{pattern,    <<".*">>},
-              {definition, [{<<"ha-mode">>, <<"all">>}]}],
+              {definition, [{<<"max-length-bytes">>, 3000000}]}],
     Param = [{value, <<"">>}],
 
     http_put(Config, "/policies/%2F/HA", Policy, {group, '2xx'}),
@@ -3552,6 +3560,15 @@ config_environment_test(Config) ->
                             proplists:get_value(rabbitmq_management, EnvList)),
     ?assertEqual(config_environment_test_value, V).
 
+
+disabled_qq_replica_opers_test(Config) ->
+    Nodename = rabbit_data_coercion:to_list(rabbit_ct_broker_helpers:get_node_config(Config, 0, nodename)),
+    Body = [{node, Nodename}],
+    http_post(Config, "/queues/quorum/%2F/qq.whatever/replicas/add", Body, ?METHOD_NOT_ALLOWED),
+    http_delete(Config, "/queues/quorum/%2F/qq.whatever/replicas/delete", ?METHOD_NOT_ALLOWED, Body),
+    http_post(Config, "/queues/quorum/replicas/on/" ++ Nodename ++ "/grow", Body, ?METHOD_NOT_ALLOWED),
+    http_delete(Config, "/queues/quorum/replicas/on/" ++ Nodename ++ "/shrink", ?METHOD_NOT_ALLOWED),
+    passed.
 
 %% -------------------------------------------------------------------
 %% Helpers.

@@ -43,6 +43,7 @@ exports_files([
 # gazelle:exclude deps/cowlib
 # gazelle:exclude deps/credentials_obfuscation
 # gazelle:exclude deps/csv
+# gazelle:exclude deps/cth_styledout
 # gazelle:exclude deps/cuttlefish
 # gazelle:exclude deps/eetcd
 # gazelle:exclude deps/elvis_mk
@@ -50,11 +51,14 @@ exports_files([
 # gazelle:exclude deps/gen_batch_server
 # gazelle:exclude deps/getopt
 # gazelle:exclude deps/gun
+# gazelle:exclude deps/inet_tcp_proxy
 # gazelle:exclude deps/jose
 # gazelle:exclude deps/json
+# gazelle:exclude deps/meck
 # gazelle:exclude deps/observer_cli
 # gazelle:exclude deps/osiris
 # gazelle:exclude deps/prometheus
+# gazelle:exclude deps/proper
 # gazelle:exclude deps/quantile_estimator
 # gazelle:exclude deps/ra
 # gazelle:exclude deps/ranch
@@ -153,7 +157,7 @@ rabbitmq_run(
     visibility = ["//visibility:public"],
 )
 
-# Allow us to `bazel run broker`
+# Allows us to `bazel run broker`
 # for the equivalent of `make run-broker`
 rabbitmq_run_command(
     name = "broker",
@@ -161,7 +165,23 @@ rabbitmq_run_command(
     subcommand = "run-broker",
 )
 
-# Allow us to `bazel run start-cluster`
+# Allows us to `bazel run background-broker`
+# to start a broker in the background
+rabbitmq_run_command(
+    name = "background-broker",
+    rabbitmq_run = ":rabbitmq-run",
+    subcommand = "start-background-broker",
+)
+
+# Allows us to `bazel run stop-broker`
+# Useful is broker started in the background
+rabbitmq_run_command(
+    name = "stop-broker",
+    rabbitmq_run = ":rabbitmq-run",
+    subcommand = "stop-node",
+)
+
+# Allows us to `bazel run start-cluster`
 # for the equivalent of `make start-cluster`
 rabbitmq_run_command(
     name = "start-cluster",
@@ -169,7 +189,7 @@ rabbitmq_run_command(
     subcommand = "start-cluster",
 )
 
-# Allow us to `bazel run stop-cluster`
+# Allows us to `bazel run stop-cluster`
 # for the equivalent of `make stop-cluster`
 rabbitmq_run_command(
     name = "stop-cluster",
